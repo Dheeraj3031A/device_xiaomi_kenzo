@@ -33,7 +33,6 @@
 #define __STDC_LIMIT_MACROS
 #include <cutils/properties.h>
 #include <hardware/camera3.h>
-#include <camera/CameraMetadata.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <fcntl.h>

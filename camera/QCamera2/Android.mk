@@ -87,11 +87,12 @@ ifneq (,$(filter kenzo,$(TARGET_DEVICE)))
 endif
 
 #LOCAL_STATIC_LIBRARIES := libqcamera2_util
+LOCAL_STATIC_LIBRARIES := android.hardware.camera.common@1.0-helper
 LOCAL_C_INCLUDES += \
         $(TARGET_OUT_HEADERS)/qcom/display
 LOCAL_C_INCLUDES += \
         hardware/qcom-caf/msm8952/display/libqservice
-LOCAL_SHARED_LIBRARIES := libcamera_client liblog libhardware libutils libcutils libdl
+LOCAL_SHARED_LIBRARIES := liblog libhardware libutils libcutils libdl
 LOCAL_SHARED_LIBRARIES += libmmcamera_interface libmmjpeg_interface libui libcamera_metadata
 LOCAL_SHARED_LIBRARIES += libqdMetaData libqservice libbinder libgui_vendor
 ifeq ($(TARGET_TS_MAKEUP),true)
