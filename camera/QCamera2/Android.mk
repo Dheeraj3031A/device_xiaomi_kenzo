@@ -49,6 +49,9 @@ LOCAL_CFLAGS += -DDEFAULT_DENOISE_MODE_ON -DHAL3
 LOCAL_C_INCLUDES := \
         frameworks/native/include/media/hardware \
         frameworks/native/include/media/openmax \
+        frameworks/native/libs/nativewindow/include \
+        frameworks/native/libs/arect/include \
+        frameworks/native/libs/nativebase/include \
         hardware/qcom-caf/msm8952/media/libstagefrighthw \
         system/media/camera/include \
         $(LOCAL_PATH)/../mm-image-codec/qexif \
