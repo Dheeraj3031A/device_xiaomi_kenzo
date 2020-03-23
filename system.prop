@@ -176,6 +176,7 @@ persist.vendor.radio.add_power_save=1
 persist.vendor.radio.start_ota_daemon=1
 persist.vendor.radio.adb_log_on=1
 persist.radio.sw_mbn_update=0
+ro.telephony.iwlan_operation_mode=legacy
 persist.data.qmi.adb_logmask=0
 persist.radio.aosp_usr_pref_sel=true
 persist.radio.cs_srv_type=1
