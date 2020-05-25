@@ -57,12 +57,12 @@ LOCAL_C_INCLUDES := \
         $(LOCAL_PATH)/../mm-image-codec/qexif \
         $(LOCAL_PATH)/../mm-image-codec/qomx_core \
         $(LOCAL_PATH)/util \
-        hardware/qcom-caf/msm8952/media/mm-core/inc \
+        hardware/qcom-caf/msm8952/media/mm-core/inc
 
 #HAL 1.0 Include paths
 LOCAL_C_INCLUDES += \
         frameworks/native/include/media/hardware \
-        device/xiaomi/kenzo/camera/QCamera2/HAL
+        $(LOCAL_PATH)/HAL
 
 LOCAL_HEADER_LIBRARIES := generated_kernel_headers
 
