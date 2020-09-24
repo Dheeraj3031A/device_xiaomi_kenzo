@@ -220,6 +220,10 @@ PRODUCT_PACKAGES += \
     e2fsck_static \
     resize2fs_static
 
+# First stage init
+PRODUCT_COPY_FILES += \
+    $(LOCAL_PATH)/rootdir/etc/fstab.ramdisk.qcom:$(TARGET_COPY_OUT_RAMDISK)/fstab.qcom
+
 # FM
 PRODUCT_PACKAGES += \
     FMRadio \
