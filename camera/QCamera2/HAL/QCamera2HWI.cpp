@@ -29,7 +29,7 @@
 
 #define LOG_TAG "QCamera2HWI"
 
-#include <utils/Log.h>
+#include <log/log.h>
 #include <cutils/properties.h>
 #include <hardware/camera.h>
 #include <stdio.h>

@@ -37,7 +37,7 @@
 #include <stdlib.h>
 #include <fcntl.h>
 #include <stdint.h>
-#include <utils/Log.h>
+#include <log/log.h>
 #include <utils/Errors.h>
 #include <ui/Fence.h>
 #include <gralloc_priv.h>

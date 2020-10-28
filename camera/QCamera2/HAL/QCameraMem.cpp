@@ -32,7 +32,7 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <utils/Errors.h>
-#include <utils/Log.h>
+#include <log/log.h>
 #include <gralloc_priv.h>
 #include <QComOMXMetadata.h>
 #include <OMX_IVCommon.h>

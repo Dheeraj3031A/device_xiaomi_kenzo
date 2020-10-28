@@ -30,7 +30,7 @@
 #define LOG_TAG "QCameraBufferMaps"
 
 #include <utils/Errors.h>
-#include <utils/Log.h>
+#include <log/log.h>
 #include <string.h>
 #include "QCameraBufferMaps.h"
 

@@ -30,7 +30,7 @@
 #ifndef __QCAMERA3CROPREGIONMAPPER_H__
 #define __QCAMERA3CROPREGIONMAPPER_H__
 
-#include <utils/Log.h>
+#include <log/log.h>
 #include <utils/Errors.h>
 #include "QCamera3HALHeader.h"
 
