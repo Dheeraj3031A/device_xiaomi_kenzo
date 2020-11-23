@@ -195,7 +195,6 @@ PRODUCT_PACKAGES += \
     hwcomposer.msm8952 \
     memtrack.msm8952 \
     libdisplayconfig \
-    liboverlay \
     libqdMetaData \
     libqdMetaData.system \
     libgenlock \
