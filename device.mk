@@ -477,12 +477,6 @@ PRODUCT_PACKAGES += \
     android.hardware.vibrator@1.0-impl \
     android.hardware.vibrator@1.0-service
 
-# VR
-PRODUCT_PACKAGES += \
-    android.hardware.vr@1.0-impl:64 \
-    android.hardware.vr@1.0-service \
-    vr.msm8952
-
 PRODUCT_COPY_FILES += \
     frameworks/native/data/etc/android.hardware.vr.high_performance.xml:$(TARGET_COPY_OUT_SYSTEM)/etc/permissions/android.hardware.vr.high_performance.xml
 
