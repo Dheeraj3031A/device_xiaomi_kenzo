@@ -444,9 +444,6 @@ on post-fs-data
     chown radio radio /data/vendor/radio/db_check_done
     chmod 0660 /data/vendor/radio/db_check_done
 
-    # set aggressive read ahead during boot up
-    write /sys/block/mmcblk0/queue/read_ahead_kb 128
-
     # Create vpp directory
     mkdir /data/vendor/vpp 0770 media media
 
