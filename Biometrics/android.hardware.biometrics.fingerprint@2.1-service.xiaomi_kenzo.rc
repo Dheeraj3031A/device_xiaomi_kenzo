@@ -5,7 +5,6 @@ service fps_hal /vendor/bin/hw/android.hardware.biometrics.fingerprint@2.1-servi
     class late_start
     user system
     group system uhid input
-    writepid /dev/cpuset/system-background/tasks
 
 on post-fs-data
     mkdir /data/goodix 0700 system system
