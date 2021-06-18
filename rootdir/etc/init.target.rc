@@ -75,6 +75,7 @@ service vendor.thermal-engine /vendor/bin/thermal-engine
    socket thermal-recv-passive-client stream 0666 system system
    socket thermal-send-rule stream 0660 system system
    group root
+   task_profiles ServiceCapacityLow
    
 service vendor.wcnss-service /system/bin/wcnss_service
     class main
@@ -104,12 +105,14 @@ service vendor.per_mgr /vendor/bin/pm-service
     class core
     user system
     group system
+    task_profiles ServiceCapacityLow
 
 service vendor.per_proxy /vendor/bin/pm-proxy
     class core
     user system
     group system
     disabled
+    task_profiles ServiceCapacityLow
 
 on property:init.svc.vendor.per_mgr=running
     start vendor.per_proxy

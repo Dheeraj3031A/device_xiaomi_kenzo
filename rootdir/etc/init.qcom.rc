@@ -465,7 +465,7 @@ service vendor.qseecomd /vendor/bin/qseecomd
     class core
     user root
     group root
-    writepid /dev/cpuset/system-background/tasks
+    task_profiles ServiceCapacityLow
 
 service iop /vendor/bin/iop
     class main
@@ -491,13 +491,13 @@ service vendor.cnd /vendor/bin/cnd
     class main
     user system
     group system wifi inet radio wakelock net_admin
-    writepid /dev/cpuset/system-background/tasks
+    task_profiles ServiceCapacityLow
 
 service vendor.dpmQmiMgr /vendor/bin/dpmQmiMgr	
     class main	
     user system	
     group radio system	
-    writepid /dev/cpuset/system-background/tasks
+    task_profiles ServiceCapacityLow
 
 service vendor.irsc_util /vendor/bin/irsc_util "/vendor/etc/sec_config"
     class core
@@ -516,7 +516,7 @@ service start_hci_filter /vendor/bin/wcnss_filter
     group bluetooth diag system wakelock
     seclabel u:r:bluetooth:s0
     disabled
-    writepid /dev/cpuset/system-background/tasks
+    task_profiles ServiceCapacityLow
 
 # FM
 on property:hw.fm.init=*
@@ -526,13 +526,13 @@ service vendor.ipacm /vendor/bin/ipacm
     class main
     user radio
     group radio inet
-    writepid /dev/cpuset/system-background/tasks
+    task_profiles ServiceCapacityLow
 
 service vendor.sensors.qti /vendor/bin/sensors.qti
     class core
     user root
     group root system input
-    writepid /dev/cpuset/system-background/tasks
+    task_profiles ServiceCapacityLow
 
 on property:ro.vendor.use_data_netmgrd=false
     # netmgr not supported on specific target
@@ -542,7 +542,7 @@ service loc_launcher /vendor/bin/loc_launcher
     #loc_launcher will start as root and set its uid to gps
     class late_start
     group gps inet diag wifi
-    writepid /dev/cpuset/system-background/tasks
+    task_profiles ServiceCapacityLow
 
 service vendor.qcom-sh /vendor/bin/init.qcom.sh
     class late_start
