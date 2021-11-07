@@ -210,6 +210,9 @@ net.tcp.2g_init_rwnd=10
 persist.timed.enable=true
 persist.delta_time.enable=true
 
+# VNDK
+ro.vndk.version=current
+
 # WiFi
 wifi.direct.interface=p2p0
 wifi.interface=wlan0
