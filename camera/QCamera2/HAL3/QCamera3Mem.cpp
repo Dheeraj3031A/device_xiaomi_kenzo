@@ -46,6 +46,8 @@ extern "C" {
 using namespace android;
 
 namespace qcamera {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunreachable-code-loop-increment"
 
 // QCaemra2Memory base class
 
@@ -1063,4 +1065,5 @@ void *QCamera3GrallocMemory::getBufferHandle(uint32_t index)
     return mBufferHandle[index];
 }
 
+#pragma clang diagnostic pop
 }; //namespace qcamera
