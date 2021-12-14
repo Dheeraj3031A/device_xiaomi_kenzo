@@ -184,6 +184,7 @@ PRODUCT_PACKAGES += \
 
 # Display
 PRODUCT_PACKAGES += \
+    android.frameworks.displayservice@1.0.vendor \
     android.hardware.configstore@1.1-service \
     android.hardware.graphics.allocator@2.0-impl \
     android.hardware.graphics.allocator@2.0-service \
@@ -194,11 +195,13 @@ PRODUCT_PACKAGES += \
     copybit.msm8952 \
     gralloc.msm8952 \
     hwcomposer.msm8952 \
-    memtrack.msm8952 \
     libdisplayconfig \
     libqdMetaData \
     libqdMetaData.system \
     libgenlock \
+    libtinyxml \
+    libtinyxml.vendor \
+    memtrack.msm8952 \
     vendor.display.config@1.0 \
     vendor.display.config@1.0_vendor
 
@@ -385,6 +388,7 @@ PRODUCT_COPY_FILES += \
     
 # Power
 PRODUCT_PACKAGES += \
+    android.hardware.power@1.2.vendor \
     android.hardware.power-service-qti \
     android.hardware.power.stats@1.0-service.mock \
     vendor.qti.hardware.perf@2.0 \
@@ -398,7 +402,8 @@ PRODUCT_PACKAGES += \
 
 # QMI
 PRODUCT_PACKAGES += \
-    libjson
+    libjson \
+    libjson.vendor
 
 # Ramdisk
 PRODUCT_PACKAGES += \
