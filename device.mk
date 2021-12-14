@@ -141,6 +141,7 @@ PRODUCT_PROPERTY_OVERRIDES += \
 
 # Bluetooth
 PRODUCT_PACKAGES += \
+    android.hardware.bluetooth@1.0.vendor \
     android.hardware.bluetooth.audio@2.0-impl \
     audio.bluetooth.default \
     libldacBT_bco \
@@ -201,8 +202,8 @@ PRODUCT_PACKAGES += \
 PRODUCT_PACKAGES += \
     android.hardware.drm@1.0-impl \
     android.hardware.drm@1.0-service \
-    android.hardware.drm@1.4-service.clearkey \
-    android.hardware.drm@1.4.vendor
+    android.hardware.drm@1.3.vendor \
+    android.hardware.drm@1.4-service.clearkey 
 
 #Face  detection extension
 PRODUCT_PACKAGES += \
@@ -241,14 +242,12 @@ PRODUCT_COPY_FILES += \
     $(LOCAL_PATH)/configs/gps/sap.conf:$(TARGET_COPY_OUT_VENDOR)/etc/sap.conf \
     $(LOCAL_PATH)/configs/gps/xtwifi.conf:$(TARGET_COPY_OUT_VENDOR)/etc/xtwifi.conf
 
-PRODUCT_PACKAGES += \
-    libwifi-hal-ctrl \
-    android.hardware.gnss@1.1.vendor \
-    android.hardware.gnss@2.1.vendor
-
 # Gatekeeper
 PRODUCT_PACKAGES += \
     android.hardware.gatekeeper@1.0.vendor
+# GNSS
+PRODUCT_PACKAGES += \
+    android.hardware.gnss@2.0.vendor
 
 # Health HAL
 PRODUCT_PACKAGES += \
@@ -265,8 +264,10 @@ PRODUCT_COPY_FILES += \
 PRODUCT_ENFORCE_VINTF_MANIFEST_OVERRIDE := true
 
 PRODUCT_PACKAGES += \
+    android.hidl.allocator@1.0.vendor \
     android.hidl.base@1.0 \
     android.hidl.manager@1.0 \
+    android.hidl.memory@1.0.vendor \
     libhidltransport \
     libhwbinder \
     vndservicemanager
@@ -384,6 +385,7 @@ PRODUCT_PACKAGES += \
 # Qualcomm dependencies
 PRODUCT_PACKAGES += \
     libtinyxml \
+    libtinyxml.vendor \
     libxml2
 
 # QMI
@@ -412,7 +414,7 @@ PRODUCT_PACKAGES += \
     android.hardware.secure_element@1.2.vendor \
     librmnetctl \
     libcnefeatureconfig \
-    libxml2 \
+    libxml2 
 
 # Seccomp policy
 PRODUCT_COPY_FILES += \
