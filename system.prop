@@ -92,6 +92,9 @@ persist.data.netmgrd.qos.enable=true
 persist.data.mode=concurrent
 persist.data.iwlan.enable=true
 
+# Dex2oat limits
+dalvik.vm.systemuicompilerfilter=speed
+
 # Display
 ro.surface_flinger.force_hwc_copy_for_virtual_displays=true
 ro.surface_flinger.max_virtual_display_dimension=2048
