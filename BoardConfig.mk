@@ -233,9 +233,6 @@ WIFI_HIDL_UNIFIED_SUPPLICANT_SERVICE_RC_ENTRY := true
 # DT2W
 TARGET_TAP_TO_WAKE_NODE := "/sys/android_touch/doubletap2wake"
 
-# Enable DRM plugins 64 bit compilation
-TARGET_ENABLE_MEDIADRM_64 := true
-
 # Inherit from the proprietary version
 include vendor/xiaomi/kenzo/BoardConfigVendor.mk
 
