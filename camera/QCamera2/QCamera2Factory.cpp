@@ -1,4 +1,4 @@
-/* Copyright (c) 2012-2016, The Linux Foundataion. All rights reserved.
+/* Copyright (c) 2012-2018, The Linux Foundation. All rights reserved.
 *
 * Redistribution and use in source and binary forms, with or without
 * modification, are permitted provided that the following conditions are
@@ -28,26 +28,38 @@
 */
 
 #define LOG_TAG "QCamera2Factory"
-//#define LOG_NDEBUG 0
 
+// System dependencies
 #include <stdlib.h>
-#include <utils/Log.h>
 #include <utils/Errors.h>
-#include <hardware/camera.h>
-#include <hardware/camera3.h>
+#include <cutils/properties.h>
 
+// Camera dependencies
+#ifdef QCAMERA_HAL1_SUPPORT
+#include "hardware/camera.h"
 #include "HAL/QCamera2HWI.h"
+#include "QCameraMuxer.h"
+#endif
+
+#include "hardware/camera3.h"
 #include "HAL3/QCamera3HWI.h"
+#include "util/QCameraFlash.h"
 #include "QCamera2Factory.h"
-#include "HAL/QCameraMuxer.h"
+#include "QCameraTrace.h"
+extern "C" {
+#include "mm_camera_dbg.h"
+}
 
 using namespace android;
 
 namespace qcamera {
 
 QCamera2Factory *gQCamera2Factory = NULL;
-QCameraMuxer *gQCameraMuxer = NULL;
 pthread_mutex_t gCamLock = PTHREAD_MUTEX_INITIALIZER;
+#ifdef QCAMERA_HAL1_SUPPORT
+QCameraMuxer *gQCameraMuxer = NULL;
+#endif
+
 //Total number of cameras opened simultaneously.
 //This variable updation is protected by gCamLock.
 uint8_t gNumCameraSessions = 0;
@@ -65,33 +77,44 @@ volatile uint32_t gKpiDebugLevel = 1;
  *==========================================================================*/
 QCamera2Factory::QCamera2Factory()
 {
-    camera_info info;
     mHalDescriptors = NULL;
     mCallbacks = NULL;
     mNumOfCameras = get_num_of_cameras();
+    mNumOfCameras_expose = get_num_of_cameras_to_expose();
     int bDualCamera = 0;
     char propDefault[PROPERTY_VALUE_MAX];
     char prop[PROPERTY_VALUE_MAX];
-    property_get("persist.camera.HAL3.enabled", prop, "1");
+    property_get("persist.vendor.camera.HAL3.enabled", prop, "1");
     int isHAL3Enabled = atoi(prop);
+#ifndef QCAMERA_HAL1_SUPPORT
+    isHAL3Enabled = 1;
+#endif
 
     // Signifies whether system has to enable dual camera mode
     snprintf(propDefault, PROPERTY_VALUE_MAX, "%d", isDualCamAvailable(isHAL3Enabled));
-    property_get("persist.camera.dual.camera", prop, propDefault);
+    property_get("persist.vendor.camera.dual.camera", prop, propDefault);
     bDualCamera = atoi(prop);
-    CDBG_HIGH("%s[%d]: dualCamera:%d ", __func__, __LINE__, bDualCamera);
+    LOGH("dualCamera:%d ", bDualCamera);
+#ifndef QCAMERA_HAL1_SUPPORT
+    bDualCamera = 0;
+#endif
 
     if(bDualCamera) {
-        ALOGI("%s[%d]: Enabling QCamera Muxer", __func__, __LINE__);
+        LOGI("Enabling QCamera Muxer");
+#ifdef QCAMERA_HAL1_SUPPORT
         if (!gQCameraMuxer) {
             QCameraMuxer::getCameraMuxer(&gQCameraMuxer, mNumOfCameras);
             if (!gQCameraMuxer) {
-                ALOGE("%s: Error !! Failed to get QCameraMuxer", __func__);
+                LOGE("Error !! Failed to get QCameraMuxer");
             }
         }
+#endif
     }
-    if (!gQCameraMuxer && (mNumOfCameras > 0) &&
-            (mNumOfCameras <= MM_CAMERA_MAX_NUM_SENSORS)) {
+#ifdef QCAMERA_HAL1_SUPPORT
+    if (!gQCameraMuxer && (mNumOfCameras > 0) &&(mNumOfCameras <= MM_CAMERA_MAX_NUM_SENSORS)) {
+#else
+    if ((mNumOfCameras > 0) &&(mNumOfCameras <= MM_CAMERA_MAX_NUM_SENSORS)) {
+#endif
         mHalDescriptors = new hal_desc[mNumOfCameras];
         if ( NULL != mHalDescriptors) {
             uint32_t cameraId = 0;
@@ -106,17 +129,12 @@ QCamera2Factory::QCamera2Factory()
                     mHalDescriptors[i].device_version =
                             CAMERA_DEVICE_API_VERSION_1_0;
                 }
-                //Query camera at this point in order
-                //to avoid any delays during subsequent
-                //calls to 'getCameraInfo()'
-                getCameraInfo(i, &info);
             }
         } else {
-            ALOGE("%s: Not enough resources to allocate HAL descriptor table!",
-                  __func__);
+            LOGE("Not enough resources to allocate HAL descriptor table!");
         }
     } else {
-        ALOGI("%s: %d camera devices detected!", __func__, mNumOfCameras);
+        LOGI("%d camera devices detected!", mNumOfCameras);
     }
 }
 
@@ -134,10 +152,12 @@ QCamera2Factory::~QCamera2Factory()
     if ( NULL != mHalDescriptors ) {
         delete [] mHalDescriptors;
     }
+#ifdef QCAMERA_HAL1_SUPPORT
     if (gQCameraMuxer) {
         delete gQCameraMuxer;
         gQCameraMuxer = NULL;
     }
+#endif
 }
 
 /*===========================================================================
@@ -156,17 +176,18 @@ int QCamera2Factory::get_number_of_cameras()
     if (!gQCamera2Factory) {
         gQCamera2Factory = new QCamera2Factory();
         if (!gQCamera2Factory) {
-            ALOGE("%s: Failed to allocate Camera2Factory object", __func__);
+            LOGE("Failed to allocate Camera2Factory object");
             return 0;
         }
     }
-
+#ifdef QCAMERA_HAL1_SUPPORT
     if(gQCameraMuxer)
         numCameras = gQCameraMuxer->get_number_of_cameras();
     else
+#endif
         numCameras = gQCamera2Factory->getNumberOfCameras();
 
-    CDBG_HIGH("%s: num of cameras: %d", __func__, numCameras);
+    LOGH("num of cameras: %d", numCameras);
     return numCameras;
 }
 
@@ -186,10 +207,11 @@ int QCamera2Factory::get_number_of_cameras()
 int QCamera2Factory::get_camera_info(int camera_id, struct camera_info *info)
 {
     int rc = NO_ERROR;
-
+#ifdef QCAMERA_HAL1_SUPPORT
     if(gQCameraMuxer)
         rc = gQCameraMuxer->get_camera_info(camera_id, info);
     else
+#endif
         rc =  gQCamera2Factory->getCameraInfo(camera_id, info);
 
     return rc;
@@ -209,9 +231,11 @@ int QCamera2Factory::get_camera_info(int camera_id, struct camera_info *info)
 int QCamera2Factory::set_callbacks(const camera_module_callbacks_t *callbacks)
 {
     int rc = NO_ERROR;
+#ifdef QCAMERA_HAL1_SUPPORT
     if(gQCameraMuxer)
         rc = gQCameraMuxer->set_callbacks(callbacks);
     else
+#endif
         rc =  gQCamera2Factory->setCallbacks(callbacks);
 
     return rc;
@@ -235,20 +259,39 @@ int QCamera2Factory::open_legacy(const struct hw_module_t* module,
 {
     int rc = NO_ERROR;
     if (module != &HAL_MODULE_INFO_SYM.common) {
-        ALOGE("Invalid module. Trying to open %p, expect %p",
+        LOGE("Invalid module. Trying to open %p, expect %p",
             module, &HAL_MODULE_INFO_SYM.common);
         return INVALID_OPERATION;
     }
     if (!id) {
-        ALOGE("Invalid camera id");
+        LOGE("Invalid camera id");
         return BAD_VALUE;
     }
+#ifdef QCAMERA_HAL1_SUPPORT
     if(gQCameraMuxer)
         rc =  gQCameraMuxer->open_legacy(module, id, halVersion, device);
     else
+#endif
         rc =  gQCamera2Factory->openLegacy(atoi(id), halVersion, device);
 
     return rc;
+}
+
+/*===========================================================================
+ * FUNCTION   : set_torch_mode
+ *
+ * DESCRIPTION: Attempt to turn on or off the torch mode of the flash unit.
+ *
+ * PARAMETERS :
+ *   @camera_id : camera ID
+ *   @on        : Indicates whether to turn the flash on or off
+ *
+ * RETURN     : 0  -- success
+ *              none-zero failure code
+ *==========================================================================*/
+int QCamera2Factory::set_torch_mode(const char* camera_id, bool on)
+{
+    return gQCamera2Factory->setTorchMode(camera_id, on);
 }
 
 /*===========================================================================
@@ -262,7 +305,7 @@ int QCamera2Factory::open_legacy(const struct hw_module_t* module,
  *==========================================================================*/
 int QCamera2Factory::getNumberOfCameras()
 {
-    return mNumOfCameras;
+    return mNumOfCameras_expose;
 }
 
 /*===========================================================================
@@ -281,37 +324,31 @@ int QCamera2Factory::getNumberOfCameras()
 int QCamera2Factory::getCameraInfo(int camera_id, struct camera_info *info)
 {
     int rc;
-    cam_sync_type_t cam_type = CAM_TYPE_MAIN;
 
     if (!mNumOfCameras || camera_id >= mNumOfCameras || !info ||
         (camera_id < 0)) {
-        ALOGE("%s: Error getting camera info!! mNumOfCameras = %d,"
+        LOGE("Error getting camera info!! mNumOfCameras = %d,"
                 "camera_id = %d, info = %p",
-                __func__, mNumOfCameras, camera_id, info);
+                 mNumOfCameras, camera_id, info);
         return -ENODEV;
     }
 
     if ( NULL == mHalDescriptors ) {
-        ALOGE("%s : Hal descriptor table is not initialized!", __func__);
+        LOGE("Hal descriptor table is not initialized!");
         return NO_INIT;
     }
 
-    if ( mHalDescriptors[camera_id].device_version ==
-            CAMERA_DEVICE_API_VERSION_3_0 ) {
-        rc = QCamera3HardwareInterface::getCamInfo(
-                mHalDescriptors[camera_id].cameraId, info);
-    } else if (mHalDescriptors[camera_id].device_version ==
-            CAMERA_DEVICE_API_VERSION_1_0) {
-        rc = QCamera2HardwareInterface::getCapabilities(
-                mHalDescriptors[camera_id].cameraId, info, &cam_type);
-    } else {
-        ALOGE("%s: Device version for camera id %d invalid %d",
-              __func__,
-              camera_id,
-              mHalDescriptors[camera_id].device_version);
-        return BAD_VALUE;
-    }
+    LOGI("Camera id %d API version %d",
+            camera_id, mHalDescriptors[camera_id].device_version);
 
+    // Need ANDROID_FLASH_INFO_AVAILABLE property for flashlight widget to
+    // work and so get the static data regardless of HAL version
+    rc = QCamera3HardwareInterface::getCamInfo(
+            mHalDescriptors[camera_id].cameraId, info);
+    if (mHalDescriptors[camera_id].device_version ==
+            CAMERA_DEVICE_API_VERSION_1_0) {
+        info->device_version = CAMERA_DEVICE_API_VERSION_1_0;
+    }
     return rc;
 }
 
@@ -332,6 +369,12 @@ int QCamera2Factory::setCallbacks(const camera_module_callbacks_t *callbacks)
 {
     int rc = NO_ERROR;
     mCallbacks = callbacks;
+
+    rc = QCameraFlash::getInstance().registerCallbacks(callbacks);
+    if (rc != 0) {
+        LOGE("Failed to register callbacks with flash module!");
+    }
+
     return rc;
 }
 
@@ -356,37 +399,41 @@ int QCamera2Factory::cameraDeviceOpen(int camera_id,
         return -ENODEV;
 
     if ( NULL == mHalDescriptors ) {
-        ALOGE("%s : Hal descriptor table is not initialized!", __func__);
+        LOGE("Hal descriptor table is not initialized!");
         return NO_INIT;
     }
 
-    ALOGI("%s: Open camera id %d API version %d", __func__,
+    LOGI("Open camera id %d API version %d",
             camera_id, mHalDescriptors[camera_id].device_version);
 
     if ( mHalDescriptors[camera_id].device_version == CAMERA_DEVICE_API_VERSION_3_0 ) {
+        CAMSCOPE_INIT(CAMSCOPE_SECTION_HAL);
         QCamera3HardwareInterface *hw = new QCamera3HardwareInterface(mHalDescriptors[camera_id].cameraId,
                 mCallbacks);
         if (!hw) {
-            ALOGE("Allocation of hardware interface failed");
+            LOGE("Allocation of hardware interface failed");
             return NO_MEMORY;
         }
         rc = hw->openCamera(hw_device);
         if (rc != 0) {
             delete hw;
         }
-    } else if (mHalDescriptors[camera_id].device_version == CAMERA_DEVICE_API_VERSION_1_0) {
+    }
+#ifdef QCAMERA_HAL1_SUPPORT
+    else if (mHalDescriptors[camera_id].device_version == CAMERA_DEVICE_API_VERSION_1_0) {
         QCamera2HardwareInterface *hw = new QCamera2HardwareInterface((uint32_t)camera_id);
         if (!hw) {
-            ALOGE("Allocation of hardware interface failed");
+            LOGE("Allocation of hardware interface failed");
             return NO_MEMORY;
         }
         rc = hw->openCamera(hw_device);
         if (rc != NO_ERROR) {
             delete hw;
         }
-    } else {
-        ALOGE("%s: Device version for camera id %d invalid %d",
-              __func__,
+    }
+#endif
+    else {
+        LOGE("Device version for camera id %d invalid %d",
               camera_id,
               mHalDescriptors[camera_id].device_version);
         return BAD_VALUE;
@@ -414,20 +461,20 @@ int QCamera2Factory::camera_device_open(
 {
     int rc = NO_ERROR;
     if (module != &HAL_MODULE_INFO_SYM.common) {
-        ALOGE("Invalid module. Trying to open %p, expect %p",
+        LOGE("Invalid module. Trying to open %p, expect %p",
             module, &HAL_MODULE_INFO_SYM.common);
         return INVALID_OPERATION;
     }
     if (!id) {
-        ALOGE("Invalid camera id");
+        LOGE("Invalid camera id");
         return BAD_VALUE;
     }
-
+#ifdef QCAMERA_HAL1_SUPPORT
     if(gQCameraMuxer)
         rc =  gQCameraMuxer->camera_device_open(module, id, hw_device);
     else
+#endif
         rc = gQCamera2Factory->cameraDeviceOpen(atoi(id), hw_device);
-
     return rc;
 }
 
@@ -453,19 +500,21 @@ int QCamera2Factory::openLegacy(
 {
     int rc = NO_ERROR;
 
-    ALOGI(":%s openLegacy halVersion: %d", __func__, halVersion);
+    LOGI("openLegacy halVersion: %d cameraId = %d", halVersion, cameraId);
     //Assumption: all cameras can support legacy API version
     if (cameraId < 0 || cameraId >= gQCamera2Factory->getNumberOfCameras())
         return -ENODEV;
 
     switch(halVersion)
     {
+#ifdef QCAMERA_HAL1_SUPPORT
         case CAMERA_DEVICE_API_VERSION_1_0:
         {
+            CAMSCOPE_INIT(CAMSCOPE_SECTION_HAL);
             QCamera2HardwareInterface *hw =
                 new QCamera2HardwareInterface((uint32_t)cameraId);
             if (!hw) {
-                ALOGE("%s: Allocation of hardware interface failed", __func__);
+                LOGE("Allocation of hardware interface failed");
                 return NO_MEMORY;
             }
             rc = hw->openCamera(hw_device);
@@ -474,13 +523,78 @@ int QCamera2Factory::openLegacy(
             }
             break;
         }
+#endif
         default:
-            ALOGE("%s: Device API version: %d for camera id %d invalid",
-                __func__, halVersion, cameraId);
+            LOGE("Device API version: %d for camera id %d invalid",
+                 halVersion, cameraId);
             return BAD_VALUE;
     }
 
     return rc;
+}
+
+/*===========================================================================
+ * FUNCTION   : setTorchMode
+ *
+ * DESCRIPTION: Attempt to turn on or off the torch mode of the flash unit.
+ *
+ * PARAMETERS :
+ *   @camera_id : camera ID
+ *   @on        : Indicates whether to turn the flash on or off
+ *
+ * RETURN     : 0  -- success
+ *              none-zero failure code
+ *==========================================================================*/
+int QCamera2Factory::setTorchMode(const char* camera_id, bool on)
+{
+    int retVal(0);
+    long cameraIdLong(-1);
+    int cameraIdInt(-1);
+    char* endPointer = NULL;
+    errno = 0;
+    QCameraFlash& flash = QCameraFlash::getInstance();
+
+    cameraIdLong = strtol(camera_id, &endPointer, 10);
+
+    if ((errno == ERANGE) ||
+            (cameraIdLong < 0) ||
+            (cameraIdLong >= static_cast<long>(get_number_of_cameras())) ||
+            (endPointer == camera_id) ||
+            (*endPointer != '\0')) {
+        retVal = -EINVAL;
+    } else if (on) {
+        cameraIdInt = static_cast<int>(cameraIdLong);
+        retVal = flash.initFlash(cameraIdInt);
+
+        if (retVal == 0) {
+            retVal = flash.setFlashMode(cameraIdInt, on);
+            if ((retVal == 0) && (mCallbacks != NULL)) {
+                mCallbacks->torch_mode_status_change(mCallbacks,
+                        camera_id,
+                        TORCH_MODE_STATUS_AVAILABLE_ON);
+            } else if (retVal == -EALREADY) {
+                // Flash is already on, so treat this as a success.
+                retVal = 0;
+            }
+        }
+    } else {
+        cameraIdInt = static_cast<int>(cameraIdLong);
+        retVal = flash.setFlashMode(cameraIdInt, on);
+
+        if (retVal == 0) {
+            retVal = flash.deinitFlash(cameraIdInt);
+            if ((retVal == 0) && (mCallbacks != NULL)) {
+                mCallbacks->torch_mode_status_change(mCallbacks,
+                        camera_id,
+                        TORCH_MODE_STATUS_AVAILABLE_OFF);
+            }
+        } else if (retVal == -EALREADY) {
+            // Flash is already off, so treat this as a success.
+            retVal = 0;
+        }
+    }
+
+    return retVal;
 }
 
 /*===========================================================================
@@ -496,24 +610,29 @@ int QCamera2Factory::openLegacy(
  *==========================================================================*/
 bool QCamera2Factory::isDualCamAvailable(int hal3Enabled)
 {
-    bool rc = FALSE;
+    bool rc = false;
     int i = 0;
     camera_info info;
     cam_sync_type_t cam_type = CAM_TYPE_MAIN;
 
     for (i = 0; i < mNumOfCameras; i++) {
         if (!hal3Enabled) {
+#ifdef QCAMERA_HAL1_SUPPORT
             QCamera2HardwareInterface::getCapabilities(i, &info, &cam_type);
+#endif
         }
 
         if(cam_type == CAM_TYPE_AUX) {
-            CDBG_HIGH("%s: Have Dual Camera HW Avaiable.", __func__);
-            rc = TRUE;
+            LOGH("Have Dual Camera HW Avaiable.");
+            rc = true;
             break;
         }
     }
-
+#ifdef QCAMERA_HAL1_SUPPORT
     return rc;
+#else
+    return false;
+#endif
 }
 
 }; // namespace qcamera

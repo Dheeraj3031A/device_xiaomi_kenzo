@@ -1,4 +1,4 @@
-/* Copyright (c) 2012-2015, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2012-2017, The Linux Foundation. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are
@@ -35,6 +35,7 @@
 #include <sys/stat.h>
 #include <sys/prctl.h>
 #include <fcntl.h>
+#include <unistd.h>
 #include <poll.h>
 #include <cam_semaphore.h>
 
@@ -87,7 +88,7 @@ static int32_t mm_camera_poll_sig_async(mm_camera_poll_thread_t *poll_cb,
     /* get the mutex */
     mm_camera_sig_evt_t cmd_evt;
 
-    CDBG("%s: E cmd = %d", __func__,cmd);
+    LOGD("E cmd = %d",cmd);
     memset(&cmd_evt, 0, sizeof(cmd_evt));
     cmd_evt.cmd = cmd;
     pthread_mutex_lock(&poll_cb->mutex);
@@ -97,16 +98,16 @@ static int32_t mm_camera_poll_sig_async(mm_camera_poll_thread_t *poll_cb,
     /* send cmd to worker */
     ssize_t len = write(poll_cb->pfds[1], &cmd_evt, sizeof(cmd_evt));
     if (len < 1) {
-        CDBG_ERROR("%s: len = %lld, errno = %d", __func__,
+        LOGW("len = %lld, errno = %d",
                 (long long int)len, errno);
         /* Avoid waiting for the signal */
         pthread_mutex_unlock(&poll_cb->mutex);
         return 0;
     }
-    CDBG("%s: begin IN mutex write done, len = %lld", __func__,
+    LOGD("begin IN mutex write done, len = %lld",
             (long long int)len);
     pthread_mutex_unlock(&poll_cb->mutex);
-    CDBG("%s: X", __func__);
+    LOGD("X");
     return 0;
 }
 
@@ -133,7 +134,7 @@ static int32_t mm_camera_poll_sig(mm_camera_poll_thread_t *poll_cb,
     /* get the mutex */
     mm_camera_sig_evt_t cmd_evt;
 
-    CDBG("%s: E cmd = %d", __func__,cmd);
+    LOGD("E cmd = %d",cmd);
     memset(&cmd_evt, 0, sizeof(cmd_evt));
     cmd_evt.cmd = cmd;
     pthread_mutex_lock(&poll_cb->mutex);
@@ -143,22 +144,22 @@ static int32_t mm_camera_poll_sig(mm_camera_poll_thread_t *poll_cb,
 
     ssize_t len = write(poll_cb->pfds[1], &cmd_evt, sizeof(cmd_evt));
     if(len < 1) {
-        CDBG_ERROR("%s: len = %lld, errno = %d", __func__,
+        LOGW("len = %lld, errno = %d",
                 (long long int)len, errno);
         /* Avoid waiting for the signal */
         pthread_mutex_unlock(&poll_cb->mutex);
         return 0;
     }
-    CDBG("%s: begin IN mutex write done, len = %lld", __func__,
+    LOGD("begin IN mutex write done, len = %lld",
             (long long int)len);
     /* wait till worker task gives positive signal */
     if (FALSE == poll_cb->status) {
-        CDBG("%s: wait", __func__);
+        LOGD("wait");
         pthread_cond_wait(&poll_cb->cond_v, &poll_cb->mutex);
     }
     /* done */
     pthread_mutex_unlock(&poll_cb->mutex);
-    CDBG("%s: X", __func__);
+    LOGD("X");
     return 0;
 }
 
@@ -177,7 +178,7 @@ static void mm_camera_poll_sig_done(mm_camera_poll_thread_t *poll_cb)
     pthread_mutex_lock(&poll_cb->mutex);
     poll_cb->status = TRUE;
     pthread_cond_signal(&poll_cb->cond_v);
-    CDBG("%s: done, in mutex", __func__);
+    LOGD("done, in mutex");
     pthread_mutex_unlock(&poll_cb->mutex);
 }
 
@@ -214,8 +215,8 @@ static void mm_camera_poll_proc_pipe(mm_camera_poll_thread_t *poll_cb)
     int i;
     mm_camera_sig_evt_t cmd_evt;
     read_len = read(poll_cb->pfds[0], &cmd_evt, sizeof(cmd_evt));
-    CDBG("%s: read_fd = %d, read_len = %d, expect_len = %d cmd = %d",
-         __func__, poll_cb->pfds[0], (int)read_len, (int)sizeof(cmd_evt), cmd_evt.cmd);
+    LOGD("read_fd = %d, read_len = %d, expect_len = %d cmd = %d",
+          poll_cb->pfds[0], (int)read_len, (int)sizeof(cmd_evt), cmd_evt.cmd);
     switch (cmd_evt.cmd) {
     case MM_CAMERA_PIPE_CMD_POLL_ENTRIES_UPDATED:
     case MM_CAMERA_PIPE_CMD_POLL_ENTRIES_UPDATED_ASYNC:
@@ -285,11 +286,11 @@ static void *mm_camera_poll_fn(mm_camera_poll_thread_t *poll_cb)
     int rc = 0, i;
 
     if (NULL == poll_cb) {
-        CDBG_ERROR("%s: poll_cb is NULL!\n", __func__);
+        LOGE("poll_cb is NULL!\n");
         return NULL;
     }
-    CDBG("%s: poll type = %d, num_fd = %d poll_cb = %p\n",
-         __func__, poll_cb->poll_type, poll_cb->num_fds,poll_cb);
+    LOGD("poll type = %d, num_fd = %d poll_cb = %p\n",
+          poll_cb->poll_type, poll_cb->num_fds,poll_cb);
     do {
          for(i = 0; i < poll_cb->num_fds; i++) {
             poll_cb->poll_fds[i].events = POLLIN|POLLRDNORM|POLLPRI;
@@ -300,14 +301,14 @@ static void *mm_camera_poll_fn(mm_camera_poll_thread_t *poll_cb)
             if ((poll_cb->poll_fds[0].revents & POLLIN) &&
                 (poll_cb->poll_fds[0].revents & POLLRDNORM)) {
                 /* if we have data on pipe, we only process pipe in this iteration */
-                CDBG("%s: cmd received on pipe\n", __func__);
+                LOGD("cmd received on pipe\n");
                 mm_camera_poll_proc_pipe(poll_cb);
             } else {
                 for(i=1; i<poll_cb->num_fds; i++) {
                     /* Checking for ctrl events */
                     if ((poll_cb->poll_type == MM_CAMERA_POLL_TYPE_EVT) &&
                         (poll_cb->poll_fds[i].revents & POLLPRI)) {
-                        CDBG("%s: mm_camera_evt_notify\n", __func__);
+                        LOGD("mm_camera_evt_notify\n");
                         if (NULL != poll_cb->poll_entries[i-1].notify_cb) {
                             poll_cb->poll_entries[i-1].notify_cb(poll_cb->poll_entries[i-1].user_data);
                         }
@@ -316,7 +317,7 @@ static void *mm_camera_poll_fn(mm_camera_poll_thread_t *poll_cb)
                     if ((MM_CAMERA_POLL_TYPE_DATA == poll_cb->poll_type) &&
                         (poll_cb->poll_fds[i].revents & POLLIN) &&
                         (poll_cb->poll_fds[i].revents & POLLRDNORM)) {
-                        CDBG("%s: mm_stream_data_notify\n", __func__);
+                        LOGD("mm_stream_data_notify\n");
                         if (NULL != poll_cb->poll_entries[i-1].notify_cb) {
                             poll_cb->poll_entries[i-1].notify_cb(poll_cb->poll_entries[i-1].user_data);
                         }
@@ -396,6 +397,7 @@ int32_t mm_camera_poll_thread_commit_updates(mm_camera_poll_thread_t * poll_cb)
  *
  * PARAMETERS :
  *   @poll_cb   : ptr to poll thread object
+ *   @idx       : Object index.
  *   @handler   : stream handle if channel data polling thread,
  *                0 if event polling thread
  *   @fd        : file descriptor need to be added into polling thread
@@ -406,22 +408,10 @@ int32_t mm_camera_poll_thread_commit_updates(mm_camera_poll_thread_t * poll_cb)
  * RETURN     : none
  *==========================================================================*/
 int32_t mm_camera_poll_thread_add_poll_fd(mm_camera_poll_thread_t * poll_cb,
-                                          uint32_t handler,
-                                          int32_t fd,
-                                          mm_camera_poll_notify_t notify_cb,
-                                          void* userdata,
-                                          mm_camera_call_type_t call_type)
+        uint8_t idx, uint32_t handler, int32_t fd, mm_camera_poll_notify_t notify_cb,
+        void* userdata, mm_camera_call_type_t call_type)
 {
     int32_t rc = -1;
-    uint8_t idx = 0;
-
-    if (MM_CAMERA_POLL_TYPE_DATA == poll_cb->poll_type) {
-        /* get stream idx from handler if CH type */
-        idx = mm_camera_util_get_index_by_handler(handler);
-    } else {
-        /* for EVT type, only idx=0 is valid */
-        idx = 0;
-    }
 
     if (MAX_STREAM_NUM_IN_BUNDLE > idx) {
         poll_cb->poll_entries[idx].fd = fd;
@@ -435,8 +425,7 @@ int32_t mm_camera_poll_thread_add_poll_fd(mm_camera_poll_thread_t * poll_cb,
             rc = mm_camera_poll_sig_async(poll_cb, MM_CAMERA_PIPE_CMD_POLL_ENTRIES_UPDATED_ASYNC );
         }
     } else {
-        CDBG_ERROR("%s: invalid handler %d (%d)",
-                   __func__, handler, idx);
+        LOGE("invalid handler %d (%d)", handler, idx);
     }
     return rc;
 }
@@ -448,6 +437,7 @@ int32_t mm_camera_poll_thread_add_poll_fd(mm_camera_poll_thread_t * poll_cb,
  *
  * PARAMETERS :
  *   @poll_cb   : ptr to poll thread object
+ *   @idx       : Object index.
  *   @handler   : stream handle if channel data polling thread,
  *                0 if event polling thread
  *
@@ -456,19 +446,9 @@ int32_t mm_camera_poll_thread_add_poll_fd(mm_camera_poll_thread_t * poll_cb,
  *              -1 -- failure
  *==========================================================================*/
 int32_t mm_camera_poll_thread_del_poll_fd(mm_camera_poll_thread_t * poll_cb,
-                                          uint32_t handler,
-                                          mm_camera_call_type_t call_type)
+        uint8_t idx, uint32_t handler, mm_camera_call_type_t call_type)
 {
     int32_t rc = -1;
-    uint8_t idx = 0;
-
-    if (MM_CAMERA_POLL_TYPE_DATA == poll_cb->poll_type) {
-        /* get stream idx from handler if CH type */
-        idx = mm_camera_util_get_index_by_handler(handler);
-    } else {
-        /* for EVT type, only idx=0 is valid */
-        idx = 0;
-    }
 
     if ((MAX_STREAM_NUM_IN_BUNDLE > idx) &&
         (handler == poll_cb->poll_entries[idx].handler)) {
@@ -484,9 +464,15 @@ int32_t mm_camera_poll_thread_del_poll_fd(mm_camera_poll_thread_t * poll_cb,
             rc = mm_camera_poll_sig_async(poll_cb, MM_CAMERA_PIPE_CMD_POLL_ENTRIES_UPDATED_ASYNC );
         }
     } else {
-        CDBG_ERROR("%s: invalid handler %d (%d)",
-                   __func__, handler, idx);
-        return -1;
+        if ((MAX_STREAM_NUM_IN_BUNDLE <= idx) ||
+                (poll_cb->poll_entries[idx].handler != 0)) {
+            LOGE("invalid handler %d (%d)", poll_cb->poll_entries[idx].handler,
+                    idx);
+            rc = -1;
+        } else {
+            LOGW("invalid handler %d (%d)", handler, idx);
+            rc = 0;
+        }
     }
 
     return rc;
@@ -498,6 +484,7 @@ int32_t mm_camera_poll_thread_launch(mm_camera_poll_thread_t * poll_cb,
     int32_t rc = 0;
     size_t i = 0, cnt = 0;
     poll_cb->poll_type = poll_type;
+    pthread_condattr_t cond_attr;
 
     //Initialize poll_fds
     cnt = sizeof(poll_cb->poll_fds) / sizeof(poll_cb->poll_fds[0]);
@@ -514,18 +501,22 @@ int32_t mm_camera_poll_thread_launch(mm_camera_poll_thread_t * poll_cb,
     poll_cb->pfds[1] = -1;
     rc = pipe(poll_cb->pfds);
     if(rc < 0) {
-        CDBG_ERROR("%s: pipe open rc=%d\n", __func__, rc);
+        LOGE("pipe open rc=%d\n", rc);
         return -1;
     }
 
     poll_cb->timeoutms = -1;  /* Infinite seconds */
 
-    CDBG("%s: poll_type = %d, read fd = %d, write fd = %d timeout = %d",
-        __func__, poll_cb->poll_type,
+    LOGD("poll_type = %d, read fd = %d, write fd = %d timeout = %d",
+         poll_cb->poll_type,
         poll_cb->pfds[0], poll_cb->pfds[1],poll_cb->timeoutms);
 
+    pthread_condattr_init(&cond_attr);
+    pthread_condattr_setclock(&cond_attr, CLOCK_MONOTONIC);
+
     pthread_mutex_init(&poll_cb->mutex, NULL);
-    pthread_cond_init(&poll_cb->cond_v, NULL);
+    pthread_cond_init(&poll_cb->cond_v, &cond_attr);
+    pthread_condattr_destroy(&cond_attr);
 
     /* launch the thread */
     pthread_mutex_lock(&poll_cb->mutex);
@@ -536,7 +527,7 @@ int32_t mm_camera_poll_thread_launch(mm_camera_poll_thread_t * poll_cb,
     }
 
     pthread_mutex_unlock(&poll_cb->mutex);
-    CDBG("%s: End",__func__);
+    LOGD("End");
     return rc;
 }
 
@@ -544,7 +535,7 @@ int32_t mm_camera_poll_thread_release(mm_camera_poll_thread_t *poll_cb)
 {
     int32_t rc = 0;
     if(MM_CAMERA_POLL_TASK_STATE_STOPPED == poll_cb->state) {
-        CDBG_ERROR("%s: err, poll thread is not running.\n", __func__);
+        LOGE("err, poll thread is not running.\n");
         return rc;
     }
 
@@ -552,7 +543,7 @@ int32_t mm_camera_poll_thread_release(mm_camera_poll_thread_t *poll_cb)
     mm_camera_poll_sig(poll_cb, MM_CAMERA_PIPE_CMD_EXIT);
     /* wait until poll thread exits */
     if (pthread_join(poll_cb->pid, NULL) != 0) {
-        CDBG_ERROR("%s: pthread dead already\n", __func__);
+        LOGD("pthread dead already\n");
     }
 
     /* close pipe */
@@ -584,8 +575,8 @@ static void *mm_camera_cmd_thread(void *data)
         do {
             ret = cam_sem_wait(&cmd_thread->cmd_sem);
             if (ret != 0 && errno != EINVAL) {
-                CDBG_ERROR("%s: cam_sem_wait error (%s)",
-                           __func__, strerror(errno));
+                LOGE("cam_sem_wait error (%s)",
+                            strerror(errno));
                 return NULL;
             }
         } while (ret != 0);
@@ -655,7 +646,7 @@ int32_t mm_camera_cmd_thread_stop(mm_camera_cmd_thread_t * cmd_thread)
     int32_t rc = 0;
     mm_camera_cmdcb_t* node = (mm_camera_cmdcb_t *)malloc(sizeof(mm_camera_cmdcb_t));
     if (NULL == node) {
-        CDBG_ERROR("%s: No memory for mm_camera_cmdcb_t", __func__);
+        LOGE("No memory for mm_camera_cmdcb_t");
         return -1;
     }
 
@@ -667,7 +658,7 @@ int32_t mm_camera_cmd_thread_stop(mm_camera_cmd_thread_t * cmd_thread)
 
     /* wait until cmd thread exits */
     if (pthread_join(cmd_thread->cmd_pid, NULL) != 0) {
-        CDBG("%s: pthread dead already\n", __func__);
+        LOGD("pthread dead already\n");
     }
     return rc;
 }

@@ -1,4 +1,4 @@
-/* Copyright (c) 2012-2015, The Linux Foundataion. All rights reserved.
+/* Copyright (c) 2012-2016, The Linux Foundation. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are
@@ -30,13 +30,14 @@
 #ifndef __QCAMERA_STREAM_H__
 #define __QCAMERA_STREAM_H__
 
-#include <hardware/camera.h>
+// Camera dependencies
+#include "hardware/camera.h"
 #include "QCameraCmdThread.h"
 #include "QCameraMem.h"
 #include "QCameraAllocator.h"
 
 extern "C" {
-#include <mm_camera_interface.h>
+#include "mm_camera_interface.h"
 }
 
 namespace qcamera {
@@ -45,6 +46,10 @@ class QCameraStream;
 typedef void (*stream_cb_routine)(mm_camera_super_buf_t *frame,
                                   QCameraStream *stream,
                                   void *userdata);
+
+#define CAMERA_MAX_CONSUMER_BATCH_BUFFER_SIZE   16
+#define CAMERA_MIN_VIDEO_BATCH_BUFFERS          3
+
 
 class QCameraStream
 {
@@ -56,7 +61,6 @@ public:
     virtual ~QCameraStream();
     virtual int32_t init(QCameraHeapMemory *streamInfoBuf,
             QCameraHeapMemory *miscBuf,
-            uint8_t minStreamBufNum,
             stream_cb_routine stream_cb,
             void *userdata,
             bool bDynallocBuf);
@@ -64,6 +68,8 @@ public:
                                     cam_crop_data_t &crop_info);
     virtual int32_t bufDone(uint32_t index);
     virtual int32_t bufDone(const void *opaque, bool isMetaData);
+    virtual int32_t bufDone(const void *opaque, bool isMetaData, QCameraVideoMemory *videoMem);
+    virtual int32_t bufDone(mm_camera_super_buf_t *super_buf);
     virtual int32_t processDataNotify(mm_camera_super_buf_t *bufs);
     virtual int32_t start();
     virtual int32_t stop();
@@ -91,11 +97,12 @@ public:
     QCameraHeapMemory *getMiscBuf() {return mMiscBuf;};
     uint32_t getMyServerID();
     cam_stream_type_t getMyType();
+    bool isStreamSyncCbNeeded();
     cam_stream_type_t getMyOriginalType();
     int32_t acquireStreamBufs();
 
     int32_t mapBuf(uint8_t buf_type, uint32_t buf_idx,
-            int32_t plane_idx, int fd, size_t size,
+            int32_t plane_idx, int fd, void *buffer, size_t size,
             mm_camera_map_unmap_ops_tbl_t *ops_tbl = NULL);
     int32_t mapBufs(cam_buf_map_type_list bufMapList,
             mm_camera_map_unmap_ops_tbl_t *ops_tbl = NULL);
@@ -111,12 +118,13 @@ public:
     static void releaseFrameData(void *data, void *user_data);
     int32_t configStream();
     bool isDeffered() const { return mDefferedAllocation; }
+    bool isSyncCBEnabled() {return mSyncCBEnabled;};
     void deleteStream();
 
     uint8_t getBufferCount() { return mNumBufs; }
     uint32_t getChannelHandle() { return mChannelHandle; }
     int32_t getNumQueuedBuf();
-
+    mm_camera_buf_def_t *getBuffer(int32_t index);
     uint32_t mDumpFrame;
     uint32_t mDumpMetaFrame;
     uint32_t mDumpSkipCnt;
@@ -124,14 +132,43 @@ public:
     void cond_wait();
     void cond_signal(bool forceExit = false);
 
+    void initDCSettings(int32_t state, uint32_t camMaster);
     int32_t setSyncDataCB(stream_cb_routine data_cb);
+    int32_t setBundleInfo();
+    int32_t switchStreamCb(uint32_t camMaster);
+    int32_t processCameraControl(uint32_t camState);
+    bool isDualStream(){return mDualStream;};
+    bool needCbSwitch();
+    bool needFrameSync();
+    uint32_t getMyCamType() { return mCamType; }
     //Stream time stamp. We need this for preview stream to update display
     nsecs_t mStreamTimestamp;
+
+    //Frame Buffer will be stored here in case framework batch mode.
+    camera_memory_t *mCurMetaMemory; // Current metadata buffer ptr
+    int8_t mCurBufIndex;             // Buffer count filled in current metadata
+    int8_t mCurMetaIndex;            // Active metadata buffer index
+
+    nsecs_t mFirstTimeStamp;         // Timestamp of first frame in Metadata.
+
+    // Buffer storage structure.
+    typedef struct {
+        bool consumerOwned; // Metadata is with Consumer if TRUE
+        uint8_t numBuffers; // Num of buffer need to released
+        uint8_t buf_index[CAMERA_MAX_CONSUMER_BATCH_BUFFER_SIZE];
+    } MetaMemory;
+    MetaMemory mStreamMetaMemory[CAMERA_MIN_VIDEO_BATCH_BUFFERS];
+    int32_t handleCacheOps(mm_camera_buf_def_t* buf);
+    void setFrameDimension(cam_dimension_t dim) {mStreamInfo->dim = dim;}
+    void setFrameOffset(cam_frame_len_offset_t offset) {mFrameLenOffset = offset;}
+    void setFormat(cam_format_t fmt) {mStreamInfo->fmt = fmt;}
 
 private:
     uint32_t mCamHandle;
     uint32_t mChannelHandle;
     uint32_t mHandle; // stream handle from mm-camera-interface
+    uint32_t mActiveCameras;
+    uint32_t mMasterCamera;
     mm_camera_ops_t *mCamOps;
     cam_stream_info_t *mStreamInfo; // ptr to stream info buf
     mm_camera_stream_mem_vtbl_t mMemVtbl;
@@ -197,6 +234,7 @@ private:
 
     static int32_t invalidate_buf(uint32_t index, void *user_data);
     static int32_t clean_invalidate_buf(uint32_t index, void *user_data);
+    static int32_t clean_buf(uint32_t index, void *user_data);
 
     static int32_t backgroundAllocate(void* data);
     static int32_t backgroundMap(void* data);
@@ -212,6 +250,7 @@ private:
             mm_camera_buf_def_t **bufs,
             mm_camera_map_unmap_ops_tbl_t *ops_tbl);
     int32_t putBufs(mm_camera_map_unmap_ops_tbl_t *ops_tbl);
+    int32_t putBufsDeffered();
 
     /* Used for deffered allocation of buffers */
     int32_t allocateBatchBufs(cam_frame_len_offset_t *offset,
@@ -222,6 +261,7 @@ private:
 
     int32_t invalidateBuf(uint32_t index);
     int32_t cleanInvalidateBuf(uint32_t index);
+    int32_t cleanBuf(uint32_t index);
     int32_t calcOffset(cam_stream_info_t *streamInfo);
     int32_t unmapStreamInfoBuf();
     int32_t releaseStreamInfoBuf();
@@ -241,6 +281,9 @@ private:
     uint32_t mAllocTaskId;
     BackgroundTask mMapTask;
     uint32_t mMapTaskId;
+    bool mSyncCBEnabled;
+    bool mDualStream;
+    uint32_t mCamType;
 };
 
 }; // namespace qcamera

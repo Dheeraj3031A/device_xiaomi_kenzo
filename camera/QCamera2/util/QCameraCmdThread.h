@@ -1,4 +1,4 @@
-/* Copyright (c) 2012, The Linux Foundataion. All rights reserved.
+/* Copyright (c) 2012, 2016, The Linux Foundation. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are
@@ -30,9 +30,11 @@
 #ifndef __QCAMERA_CMD_THREAD_H__
 #define __QCAMERA_CMD_THREAD_H__
 
+// System dependencies
 #include <pthread.h>
-#include <cam_semaphore.h>
 
+// Camera dependencies
+#include "cam_semaphore.h"
 #include "cam_types.h"
 #include "QCameraQueue.h"
 
@@ -44,12 +46,16 @@ typedef enum
     CAMERA_CMD_TYPE_START_DATA_PROC,
     CAMERA_CMD_TYPE_STOP_DATA_PROC,
     CAMERA_CMD_TYPE_DO_NEXT_JOB,
+    CAMERA_CMD_TYPE_INIT_JPEG,
     CAMERA_CMD_TYPE_EXIT,
+    CAMERA_CMD_TYPE_TIMEOUT,
+    CAMERA_CMD_TYPE_CANCEL_PP_FRAME,
     CAMERA_CMD_TYPE_MAX
 } camera_cmd_type_t;
 
 typedef struct {
     camera_cmd_type_t cmd;
+    uint8_t is_sync;
 } camera_cmd_t;
 
 class QCameraCmdThread {
@@ -62,6 +68,7 @@ public:
     int32_t exit();
     int32_t sendCmd(camera_cmd_type_t cmd, uint8_t sync_cmd, uint8_t priority);
     camera_cmd_type_t getCmd();
+    camera_cmd_type_t getCmd(uint8_t &sync_cmd);
 
     QCameraQueue cmd_queue;      /* cmd queue */
     pthread_t cmd_pid;           /* cmd thread ID */

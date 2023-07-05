@@ -1,4 +1,4 @@
-/* Copyright (c) 2015, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2015-2016, The Linux Foundation. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are
@@ -30,6 +30,7 @@
 #ifndef __QCAMERA_BUFFERMAPS_H__
 #define __QCAMERA_BUFFERMAPS_H__
 
+// Camera dependencies
 #include "cam_types.h"
 
 namespace qcamera {
@@ -45,7 +46,8 @@ public:
             int32_t pPlaneIndex,
             uint32_t pCookie,
             int32_t pFd,
-            size_t pSize);
+            size_t pSize,
+            void *buffer);
 
     ~QCameraBufferMaps();
 
@@ -57,7 +59,8 @@ public:
             int32_t pPlaneIndex,
             uint32_t pCookie,
             int32_t pFd,
-            size_t pSize);
+            size_t pSize,
+            void *buffer);
 
     uint32_t getCamBufMapList(cam_buf_map_type_list& pBufMapList) const;
 
@@ -68,7 +71,8 @@ public:
             uint32_t pCookie,
             int32_t pFd,
             size_t pSize,
-            cam_buf_map_type_list& pBufMapList);
+            cam_buf_map_type_list& pBufMapList,
+            void *buffer);
 
 private:
     cam_buf_map_type_list mBufMapList;

@@ -1,4 +1,4 @@
-/* Copyright (c) 2012, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2012, 2016, The Linux Foundation. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are
@@ -27,6 +27,10 @@
  *
  */
 
+// System dependencies
+#include <pthread.h>
+
+// Camera dependencies
 #include "cam_list.h"
 
 typedef struct {
@@ -99,6 +103,12 @@ static inline int32_t cam_queue_flush(cam_queue_t *queue)
     struct cam_list *pos = NULL;
 
     pthread_mutex_lock(&queue->lock);
+
+    if (queue->size == 0) {
+        pthread_mutex_unlock(&queue->lock);
+        return 0;
+    }
+
     head = &queue->head.list;
     pos = head->next;
 

@@ -1,10 +1,9 @@
-/*
- * Copyright (c) 2017, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2012, 2016, The Linux Foundation. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are
  * met:
- * *    * Redistributions of source code must retain the above copyright
+ *     * Redistributions of source code must retain the above copyright
  *       notice, this list of conditions and the following disclaimer.
  *     * Redistributions in binary form must reproduce the above
  *       copyright notice, this list of conditions and the following
@@ -25,13 +24,15 @@
  * WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE
  * OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN
  * IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ *
  */
 
-typedef struct _thermal_algo_info{
-   char * config_name;
-   char * algo_name;
-}thermal_algo_info_t;
-typedef struct _thermal_cfg_info {
-    unsigned int num_cfgs;
-    thermal_algo_info_t * cfgs;
-}thermal_cfg_info_t;
+#ifndef __MM_QCAMERA_DBG_H__
+#define __MM_QCAMERA_DBG_H__
+
+#ifdef QCAMERA_REDEFINE_LOG
+#define CAM_MODULE CAM_HAL_MODULE
+#include "mm_camera_dbg.h"
+#endif
+
+#endif /* __MM_QCAMERA_DBG_H__ */

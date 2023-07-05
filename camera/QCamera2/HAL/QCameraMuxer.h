@@ -1,4 +1,4 @@
-/* Copyright (c) 2015, The Linux Foundataion. All rights reserved.
+/* Copyright (c) 2015-2016, The Linux Foundation. All rights reserved.
 *
 * Redistribution and use in source and binary forms, with or without
 * modification, are permitted provided that the following conditions are
@@ -29,9 +29,9 @@
 #ifndef __QCAMERAMUXER_H__
 #define __QCAMERAMUXER_H__
 
-#include <hardware/camera.h>
-#include <system/camera.h>
+#include "hardware/camera.h"
 #include "QCamera2HWI.h"
+#include "QCamera3HWI.h"
 
 namespace qcamera {
 
@@ -88,6 +88,8 @@ typedef struct {
     cam_sync_type_t type[MAX_NUM_CAMERA_PER_BUNDLE];
     // Signifies mode of each camera
     cam_sync_mode_t mode[MAX_NUM_CAMERA_PER_BUNDLE];
+    // Signifies mode of each 3a used by the camera
+    cam_3a_sync_mode_t sync_3a[MAX_NUM_CAMERA_PER_BUNDLE];
 } qcamera_logical_descriptor_t;
 
 /* Struct@ cam_compose_jpeg_info_t

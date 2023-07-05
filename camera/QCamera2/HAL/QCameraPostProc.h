@@ -1,4 +1,4 @@
-/* Copyright (c) 2012-2015, The Linux Foundataion. All rights reserved.
+/* Copyright (c) 2012-2017, The Linux Foundation. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are
@@ -30,18 +30,24 @@
 #ifndef __QCAMERA_POSTPROC_H__
 #define __QCAMERA_POSTPROC_H__
 
-extern "C" {
-#include <mm_camera_interface.h>
-#include <mm_jpeg_interface.h>
-}
+// Camera dependencies
 #include "QCamera2HWI.h"
+#include "QCameraPprocManager.h"
+
+extern "C" {
+#include "mm_camera_interface.h"
+#include "mm_jpeg_interface.h"
+}
 
 #define MAX_JPEG_BURST 2
+#define HAL_PP_NUM_BUFS 2
 #define CAM_PP_CHANNEL_MAX 8
 
 namespace qcamera {
 
 class QCameraExif;
+class QCamera2HardwareInterface;
+class QCameraHALPPManager;
 
 typedef struct {
     uint32_t jobId;                  // job ID
@@ -54,6 +60,12 @@ typedef struct {
     bool reproc_frame_release;       // false release original buffer, true don't release it
     mm_camera_buf_def_t *src_reproc_bufs;
     QCameraExif *pJpegExifObj;
+    uint8_t offline_buffer;
+    mm_camera_buf_def_t *offline_reproc_buf; //HAL processed buffer
+    bool halPPAllocatedBuf;            // true if src frame buffer is allocated by HAL PP block
+    mm_camera_buf_def_t *hal_pp_bufs;  // bufs allocates for HAL PP
+    QCameraHeapMemory *snapshot_heap; // heap memory of snapshot buffer
+    QCameraHeapMemory *metadata_heap; // heap memory of metadata buffer
 } qcamera_jpeg_data_t;
 
 
@@ -67,12 +79,15 @@ typedef struct {
 typedef struct {
     uint32_t jobId;                  // job ID
     int8_t reprocCount;              //Current pass count
+    int8_t ppChannelIndex;           //Reprocess channel object index
     mm_camera_super_buf_t *src_frame;// source frame
     bool reproc_frame_release;       // false release original buffer
                                      // true don't release it
     mm_camera_buf_def_t *src_reproc_bufs;
     mm_camera_super_buf_t *src_reproc_frame;// source frame (need to be
                                             //returned back to kernel after done)
+    uint8_t offline_buffer;
+    mm_camera_buf_def_t *offline_reproc_buf; //HAL processed buffer
 } qcamera_pp_data_t;
 
 typedef struct {
@@ -96,7 +111,7 @@ typedef struct {
     qcamera_release_data_t   release_data; // any data needs to be release after notify
 } qcamera_data_argm_t;
 
-#define MAX_EXIF_TABLE_ENTRIES 17
+#define MAX_EXIF_TABLE_ENTRIES 50
 class QCameraExif
 {
 public:
@@ -137,6 +152,18 @@ public:
     int32_t setJpegHandle(mm_jpeg_ops_t *pJpegHandle,
             mm_jpeg_mpo_ops_t* pJpegMpoHandle, uint32_t clientHandle);
     int32_t createJpegSession(QCameraChannel *pSrcChannel);
+
+    int8_t getPPChannelCount() {return mPPChannelCount;};
+    mm_camera_buf_def_t *getOfflinePPInputBuffer(
+            mm_camera_super_buf_t *src_frame);
+    static void processHalPPDataCB(qcamera_hal_pp_data_t *pOutput, void* pUserData);
+    static void getHalPPOutputBufferCB(uint32_t frameIndex, void* pUserData);
+    static void releaseSuperBuf(mm_camera_super_buf_t *super_buf, void* pUserData);
+    QCameraMemory *mOfflineDataBufs;
+    QCameraChannel *getChannelByHandle(uint32_t channelHandle);
+    bool isHalPPEnabled() { return (m_pHalPPManager != NULL);}
+    void releaseSuperBuf(mm_camera_super_buf_t *super_buf);
+    QCamera2HardwareInterface *m_parent;
 private:
     int32_t sendDataNotify(int32_t msg_type,
             camera_memory_t *data,
@@ -150,7 +177,8 @@ private:
     mm_jpeg_format_t getJpegImgTypeFromImgFmt(cam_format_t img_fmt);
     int32_t getJpegEncodingConfig(mm_jpeg_encode_params_t& encode_parm,
                                   QCameraStream *main_stream,
-                                  QCameraStream *thumb_stream);
+                                  QCameraStream *thumb_stream,
+                                  const mm_camera_super_buf_t *halpp_out_buf = NULL);
     int32_t encodeData(qcamera_jpeg_data_t *jpeg_job_data,
                        uint8_t &needNewSess);
     int32_t queryStreams(QCameraStream **main,
@@ -162,7 +190,8 @@ private:
             mm_camera_super_buf_t *reproc_frame);
     int32_t syncStreamParams(mm_camera_super_buf_t *frame,
             mm_camera_super_buf_t *reproc_frame);
-    void releaseSuperBuf(mm_camera_super_buf_t *super_buf);
+    void releaseSuperBuf(mm_camera_super_buf_t *super_buf,
+            cam_stream_type_t stream_type);
     static void releaseNotifyData(void *user_data,
                                   void *cookie,
                                   int32_t cb_status);
@@ -182,24 +211,27 @@ private:
     static bool matchJobId(void *data, void *user_data, void *match_data);
     static int getJpegMemory(omx_jpeg_ouput_buf_t *out_buf);
     static int releaseJpegMemory(omx_jpeg_ouput_buf_t *out_buf);
-
+    int32_t processHalPPData(qcamera_hal_pp_data_t *pData);
+    void getHalPPOutputBuffer(uint32_t frameIndex);
     int32_t doReprocess();
     int32_t stopCapture();
-
+    void createHalPPManager();
+    int32_t initHalPPManager();
 private:
-    QCamera2HardwareInterface *m_parent;
     jpeg_encode_callback_t     mJpegCB;
     void *                     mJpegUserData;
     mm_jpeg_ops_t              mJpegHandle;
     mm_jpeg_mpo_ops_t          mJpegMpoHandle; // handle for mpo composition for dualcam
     uint32_t                   mJpegClientHandle;
     uint32_t                   mJpegSessionId;
+    uint32_t                   mJpegSessionIdHalPP;
 
     void *                     m_pJpegOutputMem[MM_JPEG_MAX_BUF];
+    void *                     m_pJpegOutputMemHalPP[MM_JPEG_MAX_BUF];
     QCameraExif *              m_pJpegExifObj;
     uint32_t                   m_bThumbnailNeeded;
 
-    int8_t                     mTotalNumReproc;
+    int8_t                     mPPChannelCount;
     QCameraReprocessChannel    *mPPChannels[CAM_PP_CHANNEL_MAX];
 
     camera_memory_t *          m_DataMem; // save frame mem pointer
@@ -218,12 +250,18 @@ private:
     static const char *STORE_LOCATION;  // path for storing buffers
     bool mUseSaveProc;                  // use store thread
     bool mUseJpegBurst;                 // use jpeg burst encoding mode
+    bool mUseJpegBurstHalPP;
     bool mJpegMemOpt;
     uint32_t   m_JpegOutputMemCount;
+    uint32_t   m_JpegOutputMemCountHALPP;
+    QCameraStream *pJpegSrcStream;
     uint8_t mNewJpegSessionNeeded;
+    uint8_t mNewJpegSessionNeededHalPP;
     int32_t m_bufCountPPQ;
     Vector<mm_camera_buf_def_t *> m_InputMetadata; // store input metadata buffers for AOST cases
     size_t m_PPindex;                   // counter for each incoming AOST buffer
+    pthread_mutex_t m_reprocess_lock;   // lock to ensure reprocess job is not freed early.
+    QCameraHALPPManager *m_pHalPPManager;              // HAL Post process block
 
 public:
     cam_dimension_t m_dst_dim;

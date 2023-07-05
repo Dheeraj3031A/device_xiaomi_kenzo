@@ -1,4 +1,4 @@
-/* Copyright (c) 2012-2016, The Linux Foundataion. All rights reserved.
+/* Copyright (c) 2012-2019, The Linux Foundation. All rights reserved.
 *
 * Redistribution and use in source and binary forms, with or without
 * modification, are permitted provided that the following conditions are
@@ -29,41 +29,57 @@
 
 #define LOG_TAG "QCamera2HWI"
 
-#include <utils/Log.h>
+// To remove
 #include <cutils/properties.h>
-#include <hardware/camera.h>
+
+// System definitions
+#include <utils/Errors.h>
+#include <dlfcn.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <utils/Errors.h>
-#include <gralloc_priv.h>
-#include <binder/Parcel.h>
-#include <binder/IServiceManager.h>
-#include <utils/RefBase.h>
-#include <QServiceUtils.h>
-#include <dlfcn.h>
-
+#include "gralloc_priv.h"
+#include "cutils/native_handle.h"
+#include "fdleak.h"
+#include "memleak.h"
+// Camera definitions
+#include "android/QCamera2External.h"
 #include "QCamera2HWI.h"
 #include "QCameraBufferMaps.h"
-#include "QCameraMem.h"
+#include "QCameraFlash.h"
+#include "QCameraTrace.h"
+#include "QCameraDisplay.h"
+
+extern "C" {
+#include "mm_camera_dbg.h"
+}
 
 #define MAP_TO_DRIVER_COORDINATE(val, base, scale, offset) \
-  ((int32_t)val * (int32_t)scale / (int32_t)base + (int32_t)offset)
+    ((int32_t)val * (int32_t)scale / (int32_t)base + (int32_t)offset)
 #define CAMERA_MIN_STREAMING_BUFFERS     3
 #define EXTRA_ZSL_PREVIEW_STREAM_BUF     2
 #define CAMERA_MIN_JPEG_ENCODING_BUFFERS 2
 #define CAMERA_MIN_VIDEO_BUFFERS         9
 #define CAMERA_MIN_CALLBACK_BUFFERS      5
 #define CAMERA_LONGSHOT_STAGES           4
-#define CAMERA_MIN_VIDEO_BATCH_BUFFERS   6
+#define CAMERA_MIN_CAMERA_BATCH_BUFFERS  6
 #define CAMERA_ISP_PING_PONG_BUFFERS     2
 #define MIN_UNDEQUEUED_BUFFERS           1 // This is required if preview window is not set
+#define CAMERA_MIN_DISPLAY_BUFFERS       2
+#define CAMERA_DEFAULT_FPS               30000
+#define CAMERA_BOKEH_MODE_MIN_BUFS 11
 
 #define HDR_CONFIDENCE_THRESHOLD 0.4
 
+#define CAMERA_OPEN_PERF_TIME_OUT 500 // 500 milliseconds
+
+#define PREPARE_SNAP_TIMEOUT 3 // 3 seconds
+
 // Very long wait, just to be sure we don't deadlock
 #define CAMERA_DEFERRED_THREAD_TIMEOUT 5000000000 // 5 seconds
+#define CAMERA_DEFERRED_MAP_BUF_TIMEOUT 2000000000 // 2 seconds
 #define CAMERA_MIN_METADATA_BUFFERS 10 // Need at least 10 for ZSL snapshot
 #define CAMERA_INITIAL_MAPPABLE_PREVIEW_BUFFERS 5
+#define CAMERA_MAX_PARAM_APPLY_DELAY 3
 
 namespace qcamera {
 
@@ -71,7 +87,6 @@ extern cam_capability_t *gCamCapability[MM_CAMERA_MAX_NUM_SENSORS];
 extern pthread_mutex_t gCamLock;
 volatile uint32_t gCamHalLogLevel = 1;
 extern uint8_t gNumCameraSessions;
-uint32_t QCamera2HardwareInterface::sNextJobId = 1;
 
 camera_device_ops_t QCamera2HardwareInterface::mCameraOps = {
     .set_preview_window =        QCamera2HardwareInterface::set_preview_window,
@@ -121,15 +136,15 @@ camera_device_ops_t QCamera2HardwareInterface::mCameraOps = {
 int QCamera2HardwareInterface::set_preview_window(struct camera_device *device,
         struct preview_stream_ops *window)
 {
-    ATRACE_CALL();
+    ATRACE_CAMSCOPE_CALL(CAMSCOPE_HAL1_SET_PREVIEW_WINDOW);
     int rc = NO_ERROR;
     QCamera2HardwareInterface *hw =
         reinterpret_cast<QCamera2HardwareInterface *>(device->priv);
     if (!hw) {
-        ALOGE("%s: NULL camera device", __func__);
+        LOGE("NULL camera device");
         return BAD_VALUE;
     }
-    CDBG("%s: E camera id %d window = %p", __func__, hw->getCameraId(), window);
+    LOGD("E camera id %d window = %p", hw->getCameraId(), window);
 
     hw->lockAPI();
     qcamera_api_result_t apiResult;
@@ -139,7 +154,7 @@ int QCamera2HardwareInterface::set_preview_window(struct camera_device *device,
         rc = apiResult.status;
     }
     hw->unlockAPI();
-    CDBG("%s: X camera id %d", __func__, hw->getCameraId());
+    LOGD("X camera id %d", hw->getCameraId());
 
     return rc;
 }
@@ -166,14 +181,14 @@ void QCamera2HardwareInterface::set_CallBacks(struct camera_device *device,
         camera_request_memory get_memory,
         void *user)
 {
-    ATRACE_CALL();
+    ATRACE_CAMSCOPE_CALL(CAMSCOPE_HAL1_SET_CALLBACKS);
     QCamera2HardwareInterface *hw =
         reinterpret_cast<QCamera2HardwareInterface *>(device->priv);
     if (!hw) {
-        ALOGE("NULL camera device");
+        LOGE("NULL camera device");
         return;
     }
-    CDBG("%s: E camera id %d", __func__, hw->getCameraId());
+    LOGD("E camera id %d", hw->getCameraId());
 
     qcamera_sm_evt_setcb_payload_t payload;
     payload.notify_cb = notify_cb;
@@ -189,7 +204,7 @@ void QCamera2HardwareInterface::set_CallBacks(struct camera_device *device,
         hw->waitAPIResult(QCAMERA_SM_EVT_SET_CALLBACKS, &apiResult);
     }
     hw->unlockAPI();
-    CDBG("%s: X camera id %d", __func__, hw->getCameraId());
+    LOGD("X camera id %d", hw->getCameraId());
 
 }
 
@@ -206,14 +221,14 @@ void QCamera2HardwareInterface::set_CallBacks(struct camera_device *device,
  *==========================================================================*/
 void QCamera2HardwareInterface::enable_msg_type(struct camera_device *device, int32_t msg_type)
 {
-    ATRACE_CALL();
+    ATRACE_CAMSCOPE_CALL(CAMSCOPE_HAL1_ENABLE_MSG_TYPE);
     QCamera2HardwareInterface *hw =
         reinterpret_cast<QCamera2HardwareInterface *>(device->priv);
     if (!hw) {
-        ALOGE("NULL camera device");
+        LOGE("NULL camera device");
         return;
     }
-    CDBG("%s: E camera id %d", __func__, hw->getCameraId());
+    LOGD("E camera id %d", hw->getCameraId());
 
     hw->lockAPI();
     qcamera_api_result_t apiResult;
@@ -222,7 +237,7 @@ void QCamera2HardwareInterface::enable_msg_type(struct camera_device *device, in
         hw->waitAPIResult(QCAMERA_SM_EVT_ENABLE_MSG_TYPE, &apiResult);
     }
     hw->unlockAPI();
-    CDBG("%s: X camera id %d", __func__, hw->getCameraId());
+    LOGD("X camera id %d", hw->getCameraId());
 
 }
 
@@ -239,14 +254,14 @@ void QCamera2HardwareInterface::enable_msg_type(struct camera_device *device, in
  *==========================================================================*/
 void QCamera2HardwareInterface::disable_msg_type(struct camera_device *device, int32_t msg_type)
 {
-    ATRACE_CALL();
+    ATRACE_CAMSCOPE_CALL(CAMSCOPE_HAL1_DISABLE_MSG_TYPE);
     QCamera2HardwareInterface *hw =
         reinterpret_cast<QCamera2HardwareInterface *>(device->priv);
     if (!hw) {
-        ALOGE("NULL camera device");
+        LOGE("NULL camera device");
         return;
     }
-    CDBG("%s: E camera id %d", __func__, hw->getCameraId());
+    LOGD("E camera id %d", hw->getCameraId());
 
     hw->lockAPI();
     qcamera_api_result_t apiResult;
@@ -255,7 +270,7 @@ void QCamera2HardwareInterface::disable_msg_type(struct camera_device *device, i
         hw->waitAPIResult(QCAMERA_SM_EVT_DISABLE_MSG_TYPE, &apiResult);
     }
     hw->unlockAPI();
-    CDBG("%s: X camera id %d", __func__, hw->getCameraId());
+    LOGD("X camera id %d", hw->getCameraId());
 
 }
 
@@ -273,15 +288,15 @@ void QCamera2HardwareInterface::disable_msg_type(struct camera_device *device, i
  *==========================================================================*/
 int QCamera2HardwareInterface::msg_type_enabled(struct camera_device *device, int32_t msg_type)
 {
-    ATRACE_CALL();
+    ATRACE_CAMSCOPE_CALL(CAMSCOPE_HAL1_MSG_TYPE_ENABLED);
     int ret = NO_ERROR;
     QCamera2HardwareInterface *hw =
         reinterpret_cast<QCamera2HardwareInterface *>(device->priv);
     if (!hw) {
-        ALOGE("NULL camera device");
+        LOGE("NULL camera device");
         return BAD_VALUE;
     }
-    CDBG("%s: E camera id %d", __func__, hw->getCameraId());
+    LOGD("E camera id %d", hw->getCameraId());
 
     hw->lockAPI();
     qcamera_api_result_t apiResult;
@@ -291,7 +306,7 @@ int QCamera2HardwareInterface::msg_type_enabled(struct camera_device *device, in
         ret = apiResult.enabled;
     }
     hw->unlockAPI();
-    CDBG("%s: X camera id %d", __func__, hw->getCameraId());
+    LOGD("X camera id %d", hw->getCameraId());
 
    return ret;
 }
@@ -310,16 +325,16 @@ int QCamera2HardwareInterface::msg_type_enabled(struct camera_device *device, in
  *==========================================================================*/
 int QCamera2HardwareInterface::prepare_preview(struct camera_device *device)
 {
-    ATRACE_CALL();
+    ATRACE_CAMSCOPE_CALL(CAMSCOPE_HAL1_PREPARE_PREVIEW);
     int ret = NO_ERROR;
     QCamera2HardwareInterface *hw =
         reinterpret_cast<QCamera2HardwareInterface *>(device->priv);
     if (!hw) {
-        ALOGE("NULL camera device");
+        LOGE("NULL camera device");
         return BAD_VALUE;
     }
-    ALOGI("[KPI Perf] %s: E PROFILE_PREPARE_PREVIEW camera id %d",
-            __func__, hw->getCameraId());
+    LOGH("[KPI Perf]: E PROFILE_PREPARE_PREVIEW camera id %d",
+             hw->getCameraId());
     hw->lockAPI();
     qcamera_api_result_t apiResult;
     qcamera_sm_evt_enum_t evt = QCAMERA_SM_EVT_PREPARE_PREVIEW;
@@ -329,7 +344,7 @@ int QCamera2HardwareInterface::prepare_preview(struct camera_device *device)
         ret = apiResult.status;
     }
     hw->unlockAPI();
-    ALOGI("[KPI Perf] %s: X", __func__);
+    LOGH("[KPI Perf]: X");
     return ret;
 }
 
@@ -348,20 +363,26 @@ int QCamera2HardwareInterface::prepare_preview(struct camera_device *device)
  *==========================================================================*/
 int QCamera2HardwareInterface::start_preview(struct camera_device *device)
 {
-    KPI_ATRACE_CALL();
+    KPI_ATRACE_CAMSCOPE_CALL(CAMSCOPE_HAL1_START_PREVIEW);
     int ret = NO_ERROR;
     QCamera2HardwareInterface *hw =
         reinterpret_cast<QCamera2HardwareInterface *>(device->priv);
     if (!hw) {
-        ALOGE("NULL camera device");
+        LOGE("NULL camera device");
         return BAD_VALUE;
     }
-    ALOGI("[KPI Perf] %s: E PROFILE_START_PREVIEW camera id %d",
-            __func__, hw->getCameraId());
+    LOGI("[KPI Perf]: E PROFILE_START_PREVIEW camera id %d",
+             hw->getCameraId());
+
+    hw->m_perfLockMgr.acquirePerfLockIfExpired(PERF_LOCK_START_PREVIEW);
     hw->lockAPI();
     qcamera_api_result_t apiResult;
     qcamera_sm_evt_enum_t evt = QCAMERA_SM_EVT_START_PREVIEW;
-    if (hw->isNoDisplayMode()) {
+    uint32_t cam_type = CAM_TYPE_MAIN;
+    if (hw->isDualCamera()) {
+        cam_type = MM_CAMERA_DUAL_CAM;
+    }
+    if (hw->isNoDisplayMode(cam_type)) {
         evt = QCAMERA_SM_EVT_START_NODISPLAY_PREVIEW;
     }
     ret = hw->processAPI(evt, NULL);
@@ -370,8 +391,7 @@ int QCamera2HardwareInterface::start_preview(struct camera_device *device)
         ret = apiResult.status;
     }
     hw->unlockAPI();
-    hw->m_bPreviewStarted = true;
-    ALOGI("[KPI Perf] %s: X", __func__);
+    LOGI("[KPI Perf]: X ret = %d", ret);
     return ret;
 }
 
@@ -387,15 +407,21 @@ int QCamera2HardwareInterface::start_preview(struct camera_device *device)
  *==========================================================================*/
 void QCamera2HardwareInterface::stop_preview(struct camera_device *device)
 {
-    KPI_ATRACE_CALL();
+    KPI_ATRACE_CAMSCOPE_CALL(CAMSCOPE_HAL1_STOP_PREVIEW);
     QCamera2HardwareInterface *hw =
         reinterpret_cast<QCamera2HardwareInterface *>(device->priv);
     if (!hw) {
-        ALOGE("NULL camera device");
+        LOGE("NULL camera device");
         return;
     }
-    ALOGI("[KPI Perf] %s: E PROFILE_STOP_PREVIEW camera id %d",
-            __func__, hw->getCameraId());
+    LOGI("[KPI Perf]: E PROFILE_STOP_PREVIEW camera id %d",
+             hw->getCameraId());
+
+    // Disable power Hint for preview
+    hw->m_perfLockMgr.releasePerfLock(PERF_LOCK_POWERHINT_PREVIEW);
+
+    hw->m_perfLockMgr.acquirePerfLockIfExpired(PERF_LOCK_STOP_PREVIEW);
+
     hw->lockAPI();
     qcamera_api_result_t apiResult;
     int32_t ret = hw->processAPI(QCAMERA_SM_EVT_STOP_PREVIEW, NULL);
@@ -403,7 +429,8 @@ void QCamera2HardwareInterface::stop_preview(struct camera_device *device)
         hw->waitAPIResult(QCAMERA_SM_EVT_STOP_PREVIEW, &apiResult);
     }
     hw->unlockAPI();
-    ALOGI("[KPI Perf] %s: X", __func__);
+    hw->m_perfLockMgr.releasePerfLock(PERF_LOCK_STOP_PREVIEW);
+    LOGI("[KPI Perf]: X ret = %d", ret);
 }
 
 /*===========================================================================
@@ -419,15 +446,15 @@ void QCamera2HardwareInterface::stop_preview(struct camera_device *device)
  *==========================================================================*/
 int QCamera2HardwareInterface::preview_enabled(struct camera_device *device)
 {
-    ATRACE_CALL();
+    ATRACE_CAMSCOPE_CALL(CAMSCOPE_HAL1_PREVIEW_ENABLED);
     int ret = NO_ERROR;
     QCamera2HardwareInterface *hw =
         reinterpret_cast<QCamera2HardwareInterface *>(device->priv);
     if (!hw) {
-        ALOGE("NULL camera device");
+        LOGE("NULL camera device");
         return BAD_VALUE;
     }
-    CDBG("%s: E camera id %d", __func__, hw->getCameraId());
+    LOGD("E camera id %d", hw->getCameraId());
 
     hw->lockAPI();
     qcamera_api_result_t apiResult;
@@ -439,10 +466,10 @@ int QCamera2HardwareInterface::preview_enabled(struct camera_device *device)
 
     //if preview enabled, can enable preview callback send
     if(apiResult.enabled) {
-        hw->mParameters.setPreviewCallbackNeeded(true);
+        hw->m_stateMachine.setPreviewCallbackNeeded(true);
     }
     hw->unlockAPI();
-    CDBG("%s: X camera id %d", __func__, hw->getCameraId());
+    LOGD("X camera id %d", hw->getCameraId());
 
     return ret;
 }
@@ -467,10 +494,10 @@ int QCamera2HardwareInterface::store_meta_data_in_buffers(
     QCamera2HardwareInterface *hw =
         reinterpret_cast<QCamera2HardwareInterface *>(device->priv);
     if (!hw) {
-        ALOGE("NULL camera device");
+        LOGE("NULL camera device");
         return BAD_VALUE;
     }
-    CDBG("%s: E camera id %d", __func__, hw->getCameraId());
+    LOGD("E camera id %d", hw->getCameraId());
 
     hw->lockAPI();
     qcamera_api_result_t apiResult;
@@ -480,7 +507,7 @@ int QCamera2HardwareInterface::store_meta_data_in_buffers(
         ret = apiResult.status;
     }
     hw->unlockAPI();
-    CDBG("%s: X camera id %d", __func__, hw->getCameraId());
+    LOGD("X camera id %d", hw->getCameraId());
 
     return ret;
 }
@@ -499,15 +526,15 @@ int QCamera2HardwareInterface::store_meta_data_in_buffers(
  *==========================================================================*/
 int QCamera2HardwareInterface::restart_start_preview(struct camera_device *device)
 {
-    ATRACE_CALL();
+    ATRACE_CAMSCOPE_CALL(CAMSCOPE_HAL1_RESTART_START_PREVIEW);
     int ret = NO_ERROR;
     QCamera2HardwareInterface *hw =
         reinterpret_cast<QCamera2HardwareInterface *>(device->priv);
     if (!hw) {
-        ALOGE("NULL camera device");
+        LOGE("NULL camera device");
         return BAD_VALUE;
     }
-    CDBG_HIGH("%s: E camera id %d", __func__, hw->getCameraId());
+    LOGI("E camera id %d", hw->getCameraId());
     hw->lockAPI();
     qcamera_api_result_t apiResult;
 
@@ -518,13 +545,13 @@ int QCamera2HardwareInterface::restart_start_preview(struct camera_device *devic
             ret = apiResult.status;
         }
     } else {
-        ALOGE("%s is not supposed to be called in single-camera mode", __func__);
+        LOGE("This function is not supposed to be called in single-camera mode");
         ret = INVALID_OPERATION;
     }
     // Preview restart done, update the mPreviewRestartNeeded flag to false.
     hw->mPreviewRestartNeeded = false;
     hw->unlockAPI();
-    CDBG_HIGH("%s: X camera id %d", __func__, hw->getCameraId());
+    LOGI("X camera id %d", hw->getCameraId());
 
     return ret;
 }
@@ -543,15 +570,15 @@ int QCamera2HardwareInterface::restart_start_preview(struct camera_device *devic
  *==========================================================================*/
 int QCamera2HardwareInterface::restart_stop_preview(struct camera_device *device)
 {
-    ATRACE_CALL();
+    ATRACE_CAMSCOPE_CALL(CAMSCOPE_HAL1_RESTART_STOP_PREVIEW);
     int ret = NO_ERROR;
     QCamera2HardwareInterface *hw =
         reinterpret_cast<QCamera2HardwareInterface *>(device->priv);
     if (!hw) {
-        ALOGE("NULL camera device");
+        LOGE("NULL camera device");
         return BAD_VALUE;
     }
-    CDBG_HIGH("%s: E camera id %d", __func__, hw->getCameraId());
+    LOGI("E camera id %d", hw->getCameraId());
     hw->lockAPI();
     qcamera_api_result_t apiResult;
 
@@ -562,12 +589,12 @@ int QCamera2HardwareInterface::restart_stop_preview(struct camera_device *device
             ret = apiResult.status;
         }
     } else {
-        ALOGE("%s is not supposed to be called in single-camera mode", __func__);
+        LOGE("This function is not supposed to be called in single-camera mode");
         ret = INVALID_OPERATION;
     }
 
     hw->unlockAPI();
-    CDBG_HIGH("%s: X camera id %d", __func__, hw->getCameraId());
+    LOGI("X camera id %d", hw->getCameraId());
 
     return ret;
 }
@@ -586,16 +613,16 @@ int QCamera2HardwareInterface::restart_stop_preview(struct camera_device *device
  *==========================================================================*/
 int QCamera2HardwareInterface::pre_start_recording(struct camera_device *device)
 {
-    ATRACE_CALL();
+    ATRACE_CAMSCOPE_CALL(CAMSCOPE_HAL1_PRE_START_RECORDING);
     int ret = NO_ERROR;
     QCamera2HardwareInterface *hw =
         reinterpret_cast<QCamera2HardwareInterface *>(device->priv);
     if (!hw) {
-        ALOGE("NULL camera device");
+        LOGE("NULL camera device");
         return BAD_VALUE;
     }
-    ALOGI("[KPI Perf] %s: E PROFILE_PRE_START_RECORDING camera id %d",
-            __func__, hw->getCameraId());
+    LOGH("[KPI Perf]: E PROFILE_PRE_START_RECORDING camera id %d",
+          hw->getCameraId());
     hw->lockAPI();
     qcamera_api_result_t apiResult;
     ret = hw->processAPI(QCAMERA_SM_EVT_PRE_START_RECORDING, NULL);
@@ -604,7 +631,7 @@ int QCamera2HardwareInterface::pre_start_recording(struct camera_device *device)
         ret = apiResult.status;
     }
     hw->unlockAPI();
-    ALOGI("[KPI Perf] %s: X", __func__);
+    LOGH("[KPI Perf]: X");
     return ret;
 }
 
@@ -622,22 +649,26 @@ int QCamera2HardwareInterface::pre_start_recording(struct camera_device *device)
  *==========================================================================*/
 int QCamera2HardwareInterface::start_recording(struct camera_device *device)
 {
-    ATRACE_CALL();
+    ATRACE_CAMSCOPE_CALL(CAMSCOPE_HAL1_START_RECORDING);
     int ret = NO_ERROR;
     QCamera2HardwareInterface *hw =
         reinterpret_cast<QCamera2HardwareInterface *>(device->priv);
     if (!hw) {
-        ALOGE("NULL camera device");
+        LOGE("NULL camera device");
         return BAD_VALUE;
     }
-    ALOGI("[KPI Perf] %s: E PROFILE_START_RECORDING camera id %d",
-            __func__, hw->getCameraId());
+
+    hw->m_perfLockMgr.acquirePerfLockIfExpired(PERF_LOCK_START_RECORDING);
+
+    LOGI("[KPI Perf]: E PROFILE_START_RECORDING camera id %d",
+          hw->getCameraId());
     // Give HWI control to call pre_start_recording in single camera mode.
     // In dual-cam mode, this control belongs to muxer.
     if (hw->getRelatedCamSyncInfo()->sync_control != CAM_SYNC_RELATED_SENSORS_ON) {
         ret = pre_start_recording(device);
         if (ret != NO_ERROR) {
-            ALOGE("%s: pre_start_recording failed with ret = %d",__func__,ret);
+            LOGE("pre_start_recording failed with ret = %d", ret);
+            hw->m_perfLockMgr.releasePerfLock(PERF_LOCK_START_RECORDING);
             return ret;
         }
     }
@@ -651,7 +682,8 @@ int QCamera2HardwareInterface::start_recording(struct camera_device *device)
     }
     hw->unlockAPI();
     hw->m_bRecordStarted = true;
-    ALOGI("[KPI Perf] %s: X", __func__);
+    LOGI("[KPI Perf]: X ret = %d", ret);
+
     return ret;
 }
 
@@ -667,15 +699,19 @@ int QCamera2HardwareInterface::start_recording(struct camera_device *device)
  *==========================================================================*/
 void QCamera2HardwareInterface::stop_recording(struct camera_device *device)
 {
-    ATRACE_CALL();
+    ATRACE_CAMSCOPE_CALL(CAMSCOPE_HAL1_STOP_RECORDING);
     QCamera2HardwareInterface *hw =
         reinterpret_cast<QCamera2HardwareInterface *>(device->priv);
     if (!hw) {
-        ALOGE("NULL camera device");
+        LOGE("NULL camera device");
         return;
     }
-    ALOGI("[KPI Perf] %s: E PROFILE_STOP_RECORDING camera id %d",
-            __func__, hw->getCameraId());
+
+    hw->m_perfLockMgr.acquirePerfLockIfExpired(PERF_LOCK_STOP_RECORDING);
+
+    LOGI("[KPI Perf]: E PROFILE_STOP_RECORDING camera id %d",
+             hw->getCameraId());
+
     hw->lockAPI();
     qcamera_api_result_t apiResult;
     int32_t ret = hw->processAPI(QCAMERA_SM_EVT_STOP_RECORDING, NULL);
@@ -683,7 +719,7 @@ void QCamera2HardwareInterface::stop_recording(struct camera_device *device)
         hw->waitAPIResult(QCAMERA_SM_EVT_STOP_RECORDING, &apiResult);
     }
     hw->unlockAPI();
-    ALOGI("[KPI Perf] %s: X", __func__);
+    LOGI("[KPI Perf]: X ret = %d", ret);
 }
 
 /*===========================================================================
@@ -699,15 +735,15 @@ void QCamera2HardwareInterface::stop_recording(struct camera_device *device)
  *==========================================================================*/
 int QCamera2HardwareInterface::recording_enabled(struct camera_device *device)
 {
-    ATRACE_CALL();
+    ATRACE_CAMSCOPE_CALL(CAMSCOPE_HAL1_RECORDING_ENABLED);
     int ret = NO_ERROR;
     QCamera2HardwareInterface *hw =
         reinterpret_cast<QCamera2HardwareInterface *>(device->priv);
     if (!hw) {
-        ALOGE("NULL camera device");
+        LOGE("NULL camera device");
         return BAD_VALUE;
     }
-    CDBG("%s: E camera id %d", __func__, hw->getCameraId());
+    LOGD("E camera id %d", hw->getCameraId());
     hw->lockAPI();
     qcamera_api_result_t apiResult;
     ret = hw->processAPI(QCAMERA_SM_EVT_RECORDING_ENABLED, NULL);
@@ -716,7 +752,7 @@ int QCamera2HardwareInterface::recording_enabled(struct camera_device *device)
         ret = apiResult.enabled;
     }
     hw->unlockAPI();
-    CDBG("%s: X camera id %d", __func__, hw->getCameraId());
+    LOGD("X camera id %d", hw->getCameraId());
 
     return ret;
 }
@@ -735,19 +771,19 @@ int QCamera2HardwareInterface::recording_enabled(struct camera_device *device)
 void QCamera2HardwareInterface::release_recording_frame(
             struct camera_device *device, const void *opaque)
 {
-    ATRACE_CALL();
+    ATRACE_CAMSCOPE_CALL(CAMSCOPE_HAL1_REL_REC_FRAME);
     int32_t ret = NO_ERROR;
     QCamera2HardwareInterface *hw =
         reinterpret_cast<QCamera2HardwareInterface *>(device->priv);
     if (!hw) {
-        ALOGE("NULL camera device");
+        LOGE("NULL camera device");
         return;
     }
     if (!opaque) {
-        ALOGE("%s: Error!! Frame info is NULL", __func__);
+        LOGE("Error!! Frame info is NULL");
         return;
     }
-    CDBG("%s: E camera id %d", __func__, hw->getCameraId());
+    LOGD("E camera id %d", hw->getCameraId());
 
     hw->lockAPI();
     qcamera_api_result_t apiResult;
@@ -756,7 +792,7 @@ void QCamera2HardwareInterface::release_recording_frame(
         hw->waitAPIResult(QCAMERA_SM_EVT_RELEASE_RECORIDNG_FRAME, &apiResult);
     }
     hw->unlockAPI();
-    CDBG("%s: X camera id %d", __func__, hw->getCameraId());
+    LOGD("X camera id %d", hw->getCameraId());
 }
 
 /*===========================================================================
@@ -778,11 +814,11 @@ int QCamera2HardwareInterface::auto_focus(struct camera_device *device)
     QCamera2HardwareInterface *hw =
         reinterpret_cast<QCamera2HardwareInterface *>(device->priv);
     if (!hw) {
-        ALOGE("NULL camera device");
+        LOGE("NULL camera device");
         return BAD_VALUE;
     }
-    CDBG_HIGH("[KPI Perf] %s : E PROFILE_AUTO_FOCUS camera id %d",
-            __func__, hw->getCameraId());
+    LOGH("[KPI Perf] : E PROFILE_AUTO_FOCUS camera id %d",
+             hw->getCameraId());
     hw->lockAPI();
     qcamera_api_result_t apiResult;
     ret = hw->processAPI(QCAMERA_SM_EVT_START_AUTO_FOCUS, NULL);
@@ -791,7 +827,7 @@ int QCamera2HardwareInterface::auto_focus(struct camera_device *device)
         ret = apiResult.status;
     }
     hw->unlockAPI();
-    CDBG_HIGH("[KPI Perf] %s : X", __func__);
+    LOGH("[KPI Perf] : X ret = %d", ret);
 
     return ret;
 }
@@ -810,16 +846,16 @@ int QCamera2HardwareInterface::auto_focus(struct camera_device *device)
  *==========================================================================*/
 int QCamera2HardwareInterface::cancel_auto_focus(struct camera_device *device)
 {
-    ATRACE_CALL();
+    ATRACE_CAMSCOPE_CALL(CAMSCOPE_HAL1_CANCEL_AF);
     int ret = NO_ERROR;
     QCamera2HardwareInterface *hw =
         reinterpret_cast<QCamera2HardwareInterface *>(device->priv);
     if (!hw) {
-        ALOGE("NULL camera device");
+        LOGE("NULL camera device");
         return BAD_VALUE;
     }
-    CDBG_HIGH("[KPI Perf] %s : E PROFILE_CANCEL_AUTO_FOCUS camera id %d",
-            __func__, hw->getCameraId());
+    LOGH("[KPI Perf] : E PROFILE_CANCEL_AUTO_FOCUS camera id %d",
+             hw->getCameraId());
     hw->lockAPI();
     qcamera_api_result_t apiResult;
     ret = hw->processAPI(QCAMERA_SM_EVT_STOP_AUTO_FOCUS, NULL);
@@ -828,7 +864,7 @@ int QCamera2HardwareInterface::cancel_auto_focus(struct camera_device *device)
         ret = apiResult.status;
     }
     hw->unlockAPI();
-    CDBG_HIGH("[KPI Perf] %s : X", __func__);
+    LOGH("[KPI Perf] : X ret = %d", ret);
     return ret;
 }
 
@@ -846,16 +882,16 @@ int QCamera2HardwareInterface::cancel_auto_focus(struct camera_device *device)
  *==========================================================================*/
 int QCamera2HardwareInterface::pre_take_picture(struct camera_device *device)
 {
-    ATRACE_CALL();
+    ATRACE_CAMSCOPE_CALL(CAMSCOPE_HAL1_PRE_TAKE_PICTURE);
     int ret = NO_ERROR;
     QCamera2HardwareInterface *hw =
         reinterpret_cast<QCamera2HardwareInterface *>(device->priv);
     if (!hw) {
-        ALOGE("NULL camera device");
+        LOGE("NULL camera device");
         return BAD_VALUE;
     }
-    ALOGI("[KPI Perf] %s: E PROFILE_PRE_TAKE_PICTURE camera id %d",
-            __func__, hw->getCameraId());
+    LOGH("[KPI Perf]: E PROFILE_PRE_TAKE_PICTURE camera id %d",
+          hw->getCameraId());
     hw->lockAPI();
     qcamera_api_result_t apiResult;
     ret = hw->processAPI(QCAMERA_SM_EVT_PRE_TAKE_PICTURE, NULL);
@@ -864,7 +900,7 @@ int QCamera2HardwareInterface::pre_take_picture(struct camera_device *device)
         ret = apiResult.status;
     }
     hw->unlockAPI();
-    ALOGI("[KPI Perf] %s: X", __func__);
+    LOGH("[KPI Perf]: X");
     return ret;
 }
 
@@ -882,16 +918,27 @@ int QCamera2HardwareInterface::pre_take_picture(struct camera_device *device)
  *==========================================================================*/
 int QCamera2HardwareInterface::take_picture(struct camera_device *device)
 {
-    KPI_ATRACE_CALL();
+    KPI_ATRACE_CAMSCOPE_CALL(CAMSCOPE_HAL1_TAKE_PICTURE);
     int ret = NO_ERROR;
     QCamera2HardwareInterface *hw =
         reinterpret_cast<QCamera2HardwareInterface *>(device->priv);
     if (!hw) {
-        ALOGE("NULL camera device");
+        LOGE("NULL camera device");
         return BAD_VALUE;
     }
-    ALOGI("[KPI Perf] %s: E PROFILE_TAKE_PICTURE camera id %d",
-            __func__, hw->getCameraId());
+    LOGI("[KPI Perf]: E PROFILE_TAKE_PICTURE camera id %d",
+             hw->getCameraId());
+
+    // Acquire the perf lock for JPEG snapshot only
+    if (hw->mParameters.isJpegPictureFormat()) {
+        if (hw->isDualCamera() && (hw->mParameters.getHalPPType() == CAM_HAL_PP_TYPE_BOKEH)) {
+            hw->m_perfLockMgr.acquirePerfLock(PERF_LOCK_BOKEH_SNAPSHOT,
+                    PERF_LOCK_BOKEH_SNAP_TIMEOUT_MS);
+        } else {
+            hw->m_perfLockMgr.acquirePerfLock(PERF_LOCK_TAKE_SNAPSHOT);
+        }
+    }
+
     qcamera_api_result_t apiResult;
 
    /** Added support for Retro-active Frames:
@@ -900,26 +947,28 @@ int QCamera2HardwareInterface::take_picture(struct camera_device *device)
      *  before LED estimation is triggered.
      */
 
-    CDBG_HIGH("%s: numRetroSnap %d, isLiveSnap %d, isZSL %d, isHDR %d",
-       __func__, hw->mParameters.getNumOfRetroSnapshots(),
-       hw->isLiveSnapshot(), hw->isZSLMode(), hw->isHDRMode());
+    LOGH("isLiveSnap %d, isZSL %d, isHDR %d longshot = %d",
+           hw->isLiveSnapshot(), hw->isZSLMode(), hw->isHDRMode(),
+           hw->isLongshotEnabled());
+
+    hw->m_bPreparingHardware = true;
 
     // Check for Retro-active Frames
     if ((hw->mParameters.getNumOfRetroSnapshots() > 0) &&
         !hw->isLiveSnapshot() && hw->isZSLMode() &&
-        !hw->isHDRMode() && !hw->isLongshotEnabled() &&
-        (hw->getRelatedCamSyncInfo()->sync_control != CAM_SYNC_RELATED_SENSORS_ON)) {
+        !hw->isHDRMode() && !hw->isLongshotEnabled()) {
         // Set Retro Picture Mode
         hw->setRetroPicture(1);
         hw->m_bLedAfAecLock = 0;
-        CDBG_HIGH("%s: [ZSL Retro] mode", __func__);
+        LOGL("Retro Enabled");
 
         // Give HWI control to call pre_take_picture in single camera mode.
         // In dual-cam mode, this control belongs to muxer.
         if (hw->getRelatedCamSyncInfo()->sync_control != CAM_SYNC_RELATED_SENSORS_ON) {
             ret = pre_take_picture(device);
             if (ret != NO_ERROR) {
-                ALOGE("%s: pre_take_picture failed with ret = %d",__func__,ret);
+                LOGE("pre_take_picture failed with ret = %d",ret);
+                hw->m_bPreparingHardware = false;
                 return ret;
             }
         }
@@ -930,7 +979,7 @@ int QCamera2HardwareInterface::take_picture(struct camera_device *device)
         ret = hw->processAPI(QCAMERA_SM_EVT_TAKE_PICTURE, NULL);
         if (ret == NO_ERROR) {
           // Wait for retro frames, before calling prepare snapshot
-          CDBG_HIGH("%s:[ZSL Retro] Wait for Retro frames to be done", __func__);
+          LOGD("Wait for Retro frames to be done");
           hw->waitAPIResult(QCAMERA_SM_EVT_TAKE_PICTURE, &apiResult);
             ret = apiResult.status;
         }
@@ -938,7 +987,7 @@ int QCamera2HardwareInterface::take_picture(struct camera_device *device)
         hw->unlockAPI();
 
         /* Prepare snapshot in case LED needs to be flashed */
-        CDBG_HIGH("%s: [ZSL Retro]  Start Prepare Snapshot", __func__);
+        LOGD("Start Prepare Snapshot");
         ret = hw->prepare_snapshot(device);
     }
     else {
@@ -954,7 +1003,8 @@ int QCamera2HardwareInterface::take_picture(struct camera_device *device)
         if (hw->getRelatedCamSyncInfo()->sync_control != CAM_SYNC_RELATED_SENSORS_ON) {
             ret = pre_take_picture(device);
             if (ret != NO_ERROR) {
-                ALOGE("%s: pre_take_picture failed with ret = %d",__func__,ret);
+                LOGE("pre_take_picture failed with ret = %d",ret);
+                hw->m_bPreparingHardware = false;
                 return ret;
             }
         }
@@ -963,7 +1013,7 @@ int QCamera2HardwareInterface::take_picture(struct camera_device *device)
         // go ahead with capture anyway. Just like the way autofocus
         // is handled in capture case
         /* capture */
-        CDBG_HIGH("%s: [ZSL Retro] Capturing normal frames", __func__);
+        LOGL("Capturing normal frames");
         hw->lockAPI();
         ret = hw->processAPI(QCAMERA_SM_EVT_TAKE_PICTURE, NULL);
         if (ret == NO_ERROR) {
@@ -976,7 +1026,8 @@ int QCamera2HardwareInterface::take_picture(struct camera_device *device)
             hw->mPrepSnapRun = false;
          }
     }
-    ALOGI("[KPI Perf] %s: X", __func__);
+    hw->m_bPreparingHardware = false;
+    LOGI("[KPI Perf]: X ret = %d", ret);
     return ret;
 }
 
@@ -994,16 +1045,16 @@ int QCamera2HardwareInterface::take_picture(struct camera_device *device)
  *==========================================================================*/
 int QCamera2HardwareInterface::cancel_picture(struct camera_device *device)
 {
-    ATRACE_CALL();
+    ATRACE_CAMSCOPE_CALL(CAMSCOPE_HAL1_CANCEL_PICTURE);
     int ret = NO_ERROR;
     QCamera2HardwareInterface *hw =
         reinterpret_cast<QCamera2HardwareInterface *>(device->priv);
     if (!hw) {
-        ALOGE("NULL camera device");
+        LOGE("NULL camera device");
         return BAD_VALUE;
     }
-    CDBG_HIGH("[KPI Perf] %s: E PROFILE_CANCEL_PICTURE camera id %d",
-            __func__, hw->getCameraId());
+    LOGI("[KPI Perf]: E PROFILE_CANCEL_PICTURE camera id %d",
+             hw->getCameraId());
     hw->lockAPI();
     qcamera_api_result_t apiResult;
     ret = hw->processAPI(QCAMERA_SM_EVT_CANCEL_PICTURE, NULL);
@@ -1012,7 +1063,7 @@ int QCamera2HardwareInterface::cancel_picture(struct camera_device *device)
         ret = apiResult.status;
     }
     hw->unlockAPI();
-    CDBG_HIGH("[KPI Perf] %s: X camera id %d", __func__, hw->getCameraId());
+    LOGI("[KPI Perf]: X camera id %d ret = %d", hw->getCameraId(), ret);
 
     return ret;
 }
@@ -1033,15 +1084,15 @@ int QCamera2HardwareInterface::cancel_picture(struct camera_device *device)
 int QCamera2HardwareInterface::set_parameters(struct camera_device *device,
                                               const char *parms)
 {
-    ATRACE_CALL();
+    ATRACE_CAMSCOPE_CALL(CAMSCOPE_HAL1_SET_PARAMETERS);
     int ret = NO_ERROR;
     QCamera2HardwareInterface *hw =
         reinterpret_cast<QCamera2HardwareInterface *>(device->priv);
     if (!hw) {
-        ALOGE("NULL camera device");
+        LOGE("NULL camera device");
         return BAD_VALUE;
     }
-    CDBG("%s: E camera id %d", __func__, hw->getCameraId());
+    LOGD("E camera id %d", hw->getCameraId());
     hw->lockAPI();
     qcamera_api_result_t apiResult;
     ret = hw->processAPI(QCAMERA_SM_EVT_SET_PARAMS, (void *)parms);
@@ -1050,56 +1101,47 @@ int QCamera2HardwareInterface::set_parameters(struct camera_device *device,
         ret = apiResult.status;
     }
 
-    // Give HWI control to commit parameters (restart if necessary) only
+    // Give HWI control to restart (if necessary) after set params
     // in single camera mode. In dual-cam mode, this control belongs to muxer.
-    if (ret == NO_ERROR &&
-        hw->getRelatedCamSyncInfo()->sync_control != CAM_SYNC_RELATED_SENSORS_ON) {
+    if (hw->getRelatedCamSyncInfo()->sync_control != CAM_SYNC_RELATED_SENSORS_ON) {
+        if ((ret == NO_ERROR) && hw->getNeedRestart()) {
+            LOGD("stopping after param change");
+            ret = hw->processAPI(QCAMERA_SM_EVT_SET_PARAMS_STOP, NULL);
+            if (ret == NO_ERROR) {
+                hw->waitAPIResult(QCAMERA_SM_EVT_SET_PARAMS_STOP, &apiResult);
+                ret = apiResult.status;
+            }
+        }
 
-        CDBG("%s: committing param change", __func__);
-        ret = hw->processAPI(QCAMERA_SM_EVT_COMMIT_PARAMS, NULL);
         if (ret == NO_ERROR) {
-            hw->waitAPIResult(QCAMERA_SM_EVT_COMMIT_PARAMS, &apiResult);
-            ret = apiResult.status;
+            LOGD("committing param change");
+            ret = hw->processAPI(QCAMERA_SM_EVT_SET_PARAMS_COMMIT, NULL);
+            if (ret == NO_ERROR) {
+                hw->waitAPIResult(QCAMERA_SM_EVT_SET_PARAMS_COMMIT, &apiResult);
+                ret = apiResult.status;
+            }
+        }
+
+        if ((ret == NO_ERROR) && hw->getNeedRestart()) {
+            LOGD("restarting after param change");
+            ret = hw->processAPI(QCAMERA_SM_EVT_SET_PARAMS_RESTART, NULL);
+            if (ret == NO_ERROR) {
+                hw->waitAPIResult(QCAMERA_SM_EVT_SET_PARAMS_RESTART, &apiResult);
+                ret = apiResult.status;
+            }
         }
     }
 
     hw->unlockAPI();
-    CDBG("%s: E camera id %d", __func__, hw->getCameraId());
-
-    return ret;
-}
-
-int QCamera2HardwareInterface::preview_restart_needed(
-          struct camera_device *device, int &needRestart)
-{
-    ATRACE_CALL();
-    int ret = NO_ERROR;
-    QCamera2HardwareInterface *hw =
-        reinterpret_cast<QCamera2HardwareInterface *>(device->priv);
-    if (!hw) {
-        ALOGE("NULL camera device");
-        return BAD_VALUE;
-    }
-    CDBG("%s: E camera id %d", __func__, hw->getCameraId());
-
-    hw->lockAPI();
-    qcamera_api_result_t apiResult;
-    ret = hw->processAPI(QCAMERA_SM_EVT_PREVIEW_RESTART_NEENED, NULL);
-    if (ret == NO_ERROR) {
-        hw->waitAPIResult(QCAMERA_SM_EVT_PREVIEW_RESTART_NEENED, &apiResult);
-        needRestart = apiResult.enabled;
-        ret = apiResult.status;
-    }
-    hw->unlockAPI();
-    CDBG("%s: X camera id %d", __func__, hw->getCameraId());
+    LOGD("X camera id %d ret %d", hw->getCameraId(), ret);
 
     return ret;
 }
 
 /*===========================================================================
- * FUNCTION   : commit_parameters_stop_preview
+ * FUNCTION   : stop_after_set_params
  *
- * DESCRIPTION: commit camera parameters, stop preview if necessary
+ * DESCRIPTION: stop after a set param call, if necessary
  *
  * PARAMETERS :
  *   @device  : ptr to camera device struct
@@ -1108,42 +1150,41 @@ int QCamera2HardwareInterface::preview_restart_needed(
  *              NO_ERROR  -- success
  *              none-zero failure code
  *==========================================================================*/
-int QCamera2HardwareInterface::commit_parameters_stop_preview(
-                     struct camera_device *device, int needRestart)
+int QCamera2HardwareInterface::stop_after_set_params(struct camera_device *device)
 {
-    ATRACE_CALL();
+    ATRACE_CAMSCOPE_CALL(CAMSCOPE_HAL1_STOP_AFTER_SET_PARAMS);
     int ret = NO_ERROR;
     QCamera2HardwareInterface *hw =
         reinterpret_cast<QCamera2HardwareInterface *>(device->priv);
     if (!hw) {
-        ALOGE("NULL camera device");
+        LOGE("NULL camera device");
         return BAD_VALUE;
     }
-    CDBG("%s: E camera id %d", __func__, hw->getCameraId());
+    LOGD("E camera id %d", hw->getCameraId());
     hw->lockAPI();
     qcamera_api_result_t apiResult;
 
     if (hw->getRelatedCamSyncInfo()->sync_control == CAM_SYNC_RELATED_SENSORS_ON) {
-        ret = hw->processAPI(QCAMERA_SM_EVT_COMMIT_STOP_PREVIEW, (void *)(&needRestart));
+        ret = hw->processAPI(QCAMERA_SM_EVT_SET_PARAMS_STOP, NULL);
         if (ret == NO_ERROR) {
-            hw->waitAPIResult(QCAMERA_SM_EVT_COMMIT_STOP_PREVIEW, &apiResult);
+            hw->waitAPIResult(QCAMERA_SM_EVT_SET_PARAMS_STOP, &apiResult);
             ret = apiResult.status;
         }
     } else {
-        ALOGE("%s is not supposed to be called in single-camera mode", __func__);
+        LOGE("is not supposed to be called in single-camera mode");
         ret = INVALID_OPERATION;
     }
 
     hw->unlockAPI();
-    CDBG("%s: X camera id %d", __func__, hw->getCameraId());
+    LOGD("X camera id %d", hw->getCameraId());
 
     return ret;
 }
 
 /*===========================================================================
- * FUNCTION   : commit_parameters_start_preview
+ * FUNCTION   : commit_params
  *
- * DESCRIPTION: commit camera parameters, start preview if necessary
+ * DESCRIPTION: commit after a set param call
  *
  * PARAMETERS :
  *   @device  : ptr to camera device struct
@@ -1152,35 +1193,76 @@ int QCamera2HardwareInterface::commit_parameters_stop_preview(
  *              NO_ERROR  -- success
  *              none-zero failure code
  *==========================================================================*/
-int QCamera2HardwareInterface::commit_parameters_start_preview(
-                 struct camera_device *device, int needRestart)
+int QCamera2HardwareInterface::commit_params(struct camera_device *device)
 {
-    ATRACE_CALL();
+    ATRACE_CAMSCOPE_CALL(CAMSCOPE_HAL1_COMMIT_PARAMS);
     int ret = NO_ERROR;
     QCamera2HardwareInterface *hw =
         reinterpret_cast<QCamera2HardwareInterface *>(device->priv);
     if (!hw) {
-        ALOGE("NULL camera device");
+        LOGE("NULL camera device");
         return BAD_VALUE;
     }
-    CDBG("%s: E camera id %d", __func__, hw->getCameraId());
+    LOGD("E camera id %d", hw->getCameraId());
     hw->lockAPI();
     qcamera_api_result_t apiResult;
 
     if (hw->getRelatedCamSyncInfo()->sync_control == CAM_SYNC_RELATED_SENSORS_ON) {
-        ret = hw->processAPI(QCAMERA_SM_EVT_COMMIT_START_PREVIEW, (void *)(&needRestart));
+        ret = hw->processAPI(QCAMERA_SM_EVT_SET_PARAMS_COMMIT, NULL);
         if (ret == NO_ERROR) {
-            hw->waitAPIResult(QCAMERA_SM_EVT_COMMIT_START_PREVIEW, &apiResult);
+            hw->waitAPIResult(QCAMERA_SM_EVT_SET_PARAMS_COMMIT, &apiResult);
             ret = apiResult.status;
         }
     } else {
-        ALOGE("%s is not supposed to be called in single-camera mode", __func__);
+        LOGE("is not supposed to be called in single-camera mode");
         ret = INVALID_OPERATION;
     }
 
     hw->unlockAPI();
-    CDBG("%s: X camera id %d", __func__, hw->getCameraId());
+    LOGD("X camera id %d", hw->getCameraId());
 
+    return ret;
+}
+
+/*===========================================================================
+ * FUNCTION   : restart_after_set_params
+ *
+ * DESCRIPTION: restart after a set param call, if necessary
+ *
+ * PARAMETERS :
+ *   @device  : ptr to camera device struct
+ *
+ * RETURN     : int32_t type of status
+ *              NO_ERROR  -- success
+ *              none-zero failure code
+ *==========================================================================*/
+int QCamera2HardwareInterface::restart_after_set_params(struct camera_device *device)
+{
+    ATRACE_CAMSCOPE_CALL(CAMSCOPE_HAL1_RESTART_AFTER_SET_PARAMS);
+    int ret = NO_ERROR;
+    QCamera2HardwareInterface *hw =
+        reinterpret_cast<QCamera2HardwareInterface *>(device->priv);
+    if (!hw) {
+        LOGE("NULL camera device");
+        return BAD_VALUE;
+    }
+    LOGD("E camera id %d", hw->getCameraId());
+    hw->lockAPI();
+    qcamera_api_result_t apiResult;
+
+    if (hw->getRelatedCamSyncInfo()->sync_control == CAM_SYNC_RELATED_SENSORS_ON) {
+        ret = hw->processAPI(QCAMERA_SM_EVT_SET_PARAMS_RESTART, NULL);
+        if (ret == NO_ERROR) {
+            hw->waitAPIResult(QCAMERA_SM_EVT_SET_PARAMS_RESTART, &apiResult);
+            ret = apiResult.status;
+        }
+    } else {
+        LOGE("is not supposed to be called in single-camera mode");
+        ret = INVALID_OPERATION;
+    }
+
+    hw->unlockAPI();
+    LOGD("X camera id %d", hw->getCameraId());
     return ret;
 }
 
@@ -1196,15 +1278,15 @@ int QCamera2HardwareInterface::commit_parameters_start_preview(
  *==========================================================================*/
 char* QCamera2HardwareInterface::get_parameters(struct camera_device *device)
 {
-    ATRACE_CALL();
+    ATRACE_CAMSCOPE_CALL(CAMSCOPE_HAL1_GET_PARAMETERS);
     char *ret = NULL;
     QCamera2HardwareInterface *hw =
         reinterpret_cast<QCamera2HardwareInterface *>(device->priv);
     if (!hw) {
-        ALOGE("NULL camera device");
+        LOGE("NULL camera device");
         return NULL;
     }
-    CDBG("%s: E camera id %d", __func__, hw->getCameraId());
+    LOGD("E camera id %d", hw->getCameraId());
     hw->lockAPI();
     qcamera_api_result_t apiResult;
     int32_t rc = hw->processAPI(QCAMERA_SM_EVT_GET_PARAMS, NULL);
@@ -1213,7 +1295,7 @@ char* QCamera2HardwareInterface::get_parameters(struct camera_device *device)
         ret = apiResult.params;
     }
     hw->unlockAPI();
-    CDBG("%s: E camera id %d", __func__, hw->getCameraId());
+    LOGD("E camera id %d", hw->getCameraId());
 
     return ret;
 }
@@ -1232,14 +1314,14 @@ char* QCamera2HardwareInterface::get_parameters(struct camera_device *device)
 void QCamera2HardwareInterface::put_parameters(struct camera_device *device,
                                                char *parm)
 {
-    ATRACE_CALL();
+    ATRACE_CAMSCOPE_CALL(CAMSCOPE_HAL1_PUT_PARAMETERS);
     QCamera2HardwareInterface *hw =
         reinterpret_cast<QCamera2HardwareInterface *>(device->priv);
     if (!hw) {
-        ALOGE("NULL camera device");
+        LOGE("NULL camera device");
         return;
     }
-    CDBG("%s: E camera id %d", __func__, hw->getCameraId());
+    LOGD("E camera id %d", hw->getCameraId());
     hw->lockAPI();
     qcamera_api_result_t apiResult;
     int32_t ret = hw->processAPI(QCAMERA_SM_EVT_PUT_PARAMS, (void *)parm);
@@ -1247,7 +1329,7 @@ void QCamera2HardwareInterface::put_parameters(struct camera_device *device,
         hw->waitAPIResult(QCAMERA_SM_EVT_PUT_PARAMS, &apiResult);
     }
     hw->unlockAPI();
-    CDBG("%s: E camera id %d", __func__, hw->getCameraId());
+    LOGD("E camera id %d", hw->getCameraId());
 }
 
 /*===========================================================================
@@ -1270,15 +1352,15 @@ int QCamera2HardwareInterface::send_command(struct camera_device *device,
                                             int32_t arg1,
                                             int32_t arg2)
 {
-    ATRACE_CALL();
+    ATRACE_CAMSCOPE_CALL(CAMSCOPE_HAL1_SEND_COMMAND);
     int ret = NO_ERROR;
     QCamera2HardwareInterface *hw =
         reinterpret_cast<QCamera2HardwareInterface *>(device->priv);
     if (!hw) {
-        ALOGE("NULL camera device");
+        LOGE("NULL camera device");
         return BAD_VALUE;
     }
-    CDBG("%s: E camera id %d", __func__, hw->getCameraId());
+    LOGD("E camera id %d", hw->getCameraId());
 
     qcamera_sm_evt_command_payload_t payload;
     memset(&payload, 0, sizeof(qcamera_sm_evt_command_payload_t));
@@ -1293,7 +1375,7 @@ int QCamera2HardwareInterface::send_command(struct camera_device *device,
         ret = apiResult.status;
     }
     hw->unlockAPI();
-    CDBG("%s: E camera id %d", __func__, hw->getCameraId());
+    LOGD("E camera id %d", hw->getCameraId());
 
     return ret;
 }
@@ -1318,12 +1400,12 @@ int QCamera2HardwareInterface::send_command_restart(struct camera_device *device
         int32_t arg1,
         int32_t arg2)
 {
-    ATRACE_CALL();
+    ATRACE_CAMSCOPE_CALL(CAMSCOPE_HAL1_SEND_COMMAND_RESTART);
     int ret = NO_ERROR;
     QCamera2HardwareInterface *hw =
             reinterpret_cast<QCamera2HardwareInterface *>(device->priv);
     if (!hw) {
-        ALOGE("NULL camera device");
+        LOGE("NULL camera device");
         return BAD_VALUE;
     }
 
@@ -1340,7 +1422,7 @@ int QCamera2HardwareInterface::send_command_restart(struct camera_device *device
         ret = apiResult.status;
     }
     hw->unlockAPI();
-    CDBG("%s: E camera id %d", __func__, hw->getCameraId());
+    LOGD("E camera id %d", hw->getCameraId());
 
     return ret;
 }
@@ -1357,14 +1439,14 @@ int QCamera2HardwareInterface::send_command_restart(struct camera_device *device
  *==========================================================================*/
 void QCamera2HardwareInterface::release(struct camera_device *device)
 {
-    ATRACE_CALL();
+    ATRACE_CAMSCOPE_CALL(CAMSCOPE_HAL1_RELEASE);
     QCamera2HardwareInterface *hw =
         reinterpret_cast<QCamera2HardwareInterface *>(device->priv);
     if (!hw) {
-        ALOGE("NULL camera device");
+        LOGE("NULL camera device");
         return;
     }
-    CDBG("%s: E camera id %d", __func__, hw->getCameraId());
+    LOGD("E camera id %d", hw->getCameraId());
     hw->lockAPI();
     qcamera_api_result_t apiResult;
     int32_t ret = hw->processAPI(QCAMERA_SM_EVT_RELEASE, NULL);
@@ -1372,7 +1454,7 @@ void QCamera2HardwareInterface::release(struct camera_device *device)
         hw->waitAPIResult(QCAMERA_SM_EVT_RELEASE, &apiResult);
     }
     hw->unlockAPI();
-    CDBG("%s: E camera id %d", __func__, hw->getCameraId());
+    LOGD("E camera id %d", hw->getCameraId());
 }
 
 /*===========================================================================
@@ -1399,10 +1481,10 @@ int QCamera2HardwareInterface::dump(struct camera_device *device, int fd)
     QCamera2HardwareInterface *hw =
         reinterpret_cast<QCamera2HardwareInterface *>(device->priv);
     if (!hw) {
-        ALOGE("NULL camera device");
+        LOGE("NULL camera device");
         return BAD_VALUE;
     }
-    CDBG("%s: E camera id %d", __func__, hw->getCameraId());
+    LOGD("E camera id %d", hw->getCameraId());
     hw->lockAPI();
     qcamera_api_result_t apiResult;
     ret = hw->processAPI(QCAMERA_SM_EVT_DUMP, (void *)&fd);
@@ -1411,7 +1493,7 @@ int QCamera2HardwareInterface::dump(struct camera_device *device, int fd)
         ret = apiResult.status;
     }
     hw->unlockAPI();
-    CDBG("%s: E camera id %d", __func__, hw->getCameraId());
+    LOGD("E camera id %d", hw->getCameraId());
 
     return ret;
 }
@@ -1430,18 +1512,39 @@ int QCamera2HardwareInterface::dump(struct camera_device *device, int fd)
  *==========================================================================*/
 int QCamera2HardwareInterface::close_camera_device(hw_device_t *hw_dev)
 {
-    KPI_ATRACE_CALL();
+    KPI_ATRACE_CAMSCOPE_BEGIN(CAMSCOPE_HAL1_CLOSECAMERA);
     int ret = NO_ERROR;
+    char prop[PROPERTY_VALUE_MAX];
+    int enable_fdleak=0;
+    int enable_memleak=0;
     QCamera2HardwareInterface *hw =
         reinterpret_cast<QCamera2HardwareInterface *>(
             reinterpret_cast<camera_device_t *>(hw_dev)->priv);
     if (!hw) {
-        ALOGE("%s: NULL camera device", __func__);
+        LOGE("NULL camera device");
         return BAD_VALUE;
     }
-    ALOGI("[KPI Perf] %s: E camera id %d",__func__, hw->getCameraId());
+    LOGI("[KPI Perf]: E camera id %d", hw->getCameraId());
     delete hw;
-    ALOGI("[KPI Perf] %s: X",__func__);
+#ifdef FDLEAK_FLAG
+    property_get("persist.vendor.camera.fdleak.enable", prop, "0");
+    enable_fdleak = atoi(prop);
+    if (enable_fdleak) {
+       LOGI("fdleak tool dump list");
+    hal_debug_dump_fdleak_trace();
+    }
+#endif
+#ifdef MEMLEAK_FLAG
+    property_get("persist.vendor.camera.memleak.enable", prop, "0");
+    enable_memleak = atoi(prop);
+    if (enable_memleak) {
+       LOGI("memleak tool dump list");
+    hal_debug_dump_memleak_trace();
+    }
+#endif
+    LOGI("[KPI Perf]: X");
+    KPI_ATRACE_CAMSCOPE_END(CAMSCOPE_HAL1_CLOSECAMERA);
+    CAMSCOPE_DESTROY(CAMSCOPE_SECTION_HAL);
     return ret;
 }
 
@@ -1463,15 +1566,15 @@ int QCamera2HardwareInterface::register_face_image(struct camera_device *device,
                                                    void *img_ptr,
                                                    cam_pp_offline_src_config_t *config)
 {
-    ATRACE_CALL();
+    ATRACE_CAMSCOPE_CALL(CAMSCOPE_HAL1_REGISTER_FACE_IMAGE);
     int ret = NO_ERROR;
     QCamera2HardwareInterface *hw =
         reinterpret_cast<QCamera2HardwareInterface *>(device->priv);
     if (!hw) {
-        ALOGE("NULL camera device");
+        LOGE("NULL camera device");
         return BAD_VALUE;
     }
-    CDBG("%s: E camera id %d", __func__, hw->getCameraId());
+    LOGD("E camera id %d", hw->getCameraId());
     qcamera_sm_evt_reg_face_payload_t payload;
     memset(&payload, 0, sizeof(qcamera_sm_evt_reg_face_payload_t));
     payload.img_ptr = img_ptr;
@@ -1484,7 +1587,7 @@ int QCamera2HardwareInterface::register_face_image(struct camera_device *device,
         ret = apiResult.handle;
     }
     hw->unlockAPI();
-    CDBG("%s: E camera id %d", __func__, hw->getCameraId());
+    LOGD("E camera id %d", hw->getCameraId());
 
     return ret;
 }
@@ -1503,39 +1606,37 @@ int QCamera2HardwareInterface::register_face_image(struct camera_device *device,
  *==========================================================================*/
 int QCamera2HardwareInterface::prepare_snapshot(struct camera_device *device)
 {
-    ATRACE_CALL();
+    ATRACE_CAMSCOPE_CALL(CAMSCOPE_HAL1_PREPARE_SNAPSHOT);
     int ret = NO_ERROR;
     QCamera2HardwareInterface *hw =
         reinterpret_cast<QCamera2HardwareInterface *>(device->priv);
     if (!hw) {
-        ALOGE("NULL camera device");
+        LOGE("NULL camera device");
         return BAD_VALUE;
     }
     if (hw->isLongshotEnabled() && hw->mPrepSnapRun == true) {
         // For longshot mode, we prepare snapshot only once
-        ALOGI("%s: prepare snapshot only once ", __func__);
+        LOGH("prepare snapshot only once ");
         return NO_ERROR;
     }
-    ALOGI("[KPI Perf] %s: E PROFILE_PREPARE_SNAPSHOT camera id %d",
-            __func__, hw->getCameraId());
+    LOGH("[KPI Perf]: E PROFILE_PREPARE_SNAPSHOT camera id %d",
+             hw->getCameraId());
     hw->lockAPI();
     qcamera_api_result_t apiResult;
 
     /* Prepare snapshot in case LED needs to be flashed */
     if (hw->mFlashNeeded || hw->mParameters.isChromaFlashEnabled()) {
-        CDBG_HIGH("%s: mFlashNeeded: %d ChromaFlash :%d",
-                __func__, hw->mFlashNeeded,
-                hw->mParameters.isChromaFlashEnabled());
         /* Prepare snapshot in case LED needs to be flashed */
         ret = hw->processAPI(QCAMERA_SM_EVT_PREPARE_SNAPSHOT, NULL);
         if (ret == NO_ERROR) {
-          hw->waitAPIResult(QCAMERA_SM_EVT_PREPARE_SNAPSHOT, &apiResult);
+            hw->waitAPIResult(QCAMERA_SM_EVT_PREPARE_SNAPSHOT,
+                    &apiResult, PREPARE_SNAP_TIMEOUT);
             ret = apiResult.status;
         }
         hw->mPrepSnapRun = true;
     }
     hw->unlockAPI();
-    ALOGI("[KPI Perf] %s: X, ret: %d", __func__, ret);
+    LOGH("[KPI Perf]: X, ret: %d", ret);
     return ret;
 }
 
@@ -1552,7 +1653,11 @@ int QCamera2HardwareInterface::prepare_snapshot(struct camera_device *device)
 QCamera2HardwareInterface::QCamera2HardwareInterface(uint32_t cameraId)
     : mCameraId(cameraId),
       mCameraHandle(NULL),
+      mMasterCamera(CAM_TYPE_MAIN),
+      mFallbackMode(CAM_NO_FALLBACK),
       mCameraOpened(false),
+      mDualCamera(false),
+      m_pFovControl(NULL),
       m_bRelCamCalibValid(false),
       mPreviewWindow(NULL),
       mMsgEnabled(0),
@@ -1566,21 +1671,23 @@ QCamera2HardwareInterface::QCamera2HardwareInterface(uint32_t cameraId)
       m_postprocessor(this),
       m_thermalAdapter(QCameraThermalAdapter::getInstance()),
       m_cbNotifier(this),
+      m_perfLockMgr(),
       m_bPreviewStarted(false),
+      m_bFirstPreviewFrameReceived(false),
       m_bRecordStarted(false),
+      m_bPreparingHardware(false),
+      m_bNeedVideoCb(false),
       m_currentFocusState(CAM_AF_STATE_INACTIVE),
-      m_pPowerModule(NULL),
       mDumpFrmCnt(0U),
       mDumpSkipCnt(0U),
       mThermalLevel(QCAMERA_THERMAL_NO_ADJUSTMENT),
       mActiveAF(false),
       m_HDRSceneEnabled(false),
       mLongshotEnabled(false),
-      m_max_pic_width(0),
-      m_max_pic_height(0),
       mLiveSnapshotThread(0),
       mIntPicThread(0),
       mFlashNeeded(false),
+      mFlashConfigured(false),
       mDeviceRotation(0U),
       mCaptureRotation(0U),
       mJpegExifRotation(0U),
@@ -1597,10 +1704,10 @@ QCamera2HardwareInterface::QCamera2HardwareInterface(uint32_t cameraId)
       mPLastFrameCount(0),
       mPLastFpsTime(0),
       mPFps(0),
+      mLowLightConfigured(false),
       mInstantAecFrameCount(0),
       m_bIntJpegEvtPending(false),
       m_bIntRawEvtPending(false),
-      mPostviewJob(0),
       mReprocJob(0),
       mJpegJob(0),
       mMetadataAllocJob(0),
@@ -1614,46 +1721,54 @@ QCamera2HardwareInterface::QCamera2HardwareInterface(uint32_t cameraId)
       mNumPreviewFaces(-1),
       mJpegClientHandle(0),
       mJpegHandleOwner(false),
-      mCACDoneReceived(false),
       mMetadataMem(NULL),
-      mBootToMonoTimestampOffset(0)
+      mNextJobId(1),
+      mCACDoneReceived(false),
+      m_bNeedRestart(false),
+      mBootToMonoTimestampOffset(0),
+      bDepthAFCallbacks(true),
+      m_bNeedHalPP(FALSE)
 {
 #ifdef TARGET_TS_MAKEUP
     memset(&mFaceRect, -1, sizeof(mFaceRect));
 #endif
     getLogLevel();
-    ATRACE_CALL();
+    ATRACE_CAMSCOPE_CALL(CAMSCOPE_HAL1_QCAMERA2HWI);
     mCameraDevice.common.tag = HARDWARE_DEVICE_TAG;
     mCameraDevice.common.version = HARDWARE_DEVICE_API_VERSION(1, 0);
     mCameraDevice.common.close = close_camera_device;
     mCameraDevice.ops = &mCameraOps;
     mCameraDevice.priv = this;
 
+#ifndef USE_DISPLAY_SERVICE
+    mCameraDisplay = new QCameraDisplay();
+#else
+    mCameraDisplay = QCameraDisplay::instance();
+#endif
+    mDualCamera = is_dual_camera_by_idx(cameraId);
+    pthread_condattr_t mCondAttr;
+
+    pthread_condattr_init(&mCondAttr);
+    pthread_condattr_setclock(&mCondAttr, CLOCK_MONOTONIC);
+
     pthread_mutex_init(&m_lock, NULL);
-    pthread_cond_init(&m_cond, NULL);
+    pthread_cond_init(&m_cond, &mCondAttr);
 
     m_apiResultList = NULL;
 
     pthread_mutex_init(&m_evtLock, NULL);
-    pthread_cond_init(&m_evtCond, NULL);
+    pthread_cond_init(&m_evtCond, &mCondAttr);
     memset(&m_evtResult, 0, sizeof(qcamera_api_result_t));
 
-    pthread_mutex_init(&m_parm_lock, NULL);
-
     pthread_mutex_init(&m_int_lock, NULL);
-    pthread_cond_init(&m_int_cond, NULL);
+    pthread_cond_init(&m_int_cond, &mCondAttr);
+    pthread_condattr_destroy(&mCondAttr);
 
     memset(m_channels, 0, sizeof(m_channels));
 
     memset(&mExifParams, 0, sizeof(mm_jpeg_exif_params_t));
 
     memset(m_BackendFileName, 0, QCAMERA_MAX_FILEPATH_LENGTH);
-
-#ifdef HAS_MULTIMEDIA_HINTS
-    if (hw_get_module(POWER_HARDWARE_MODULE_ID, (const hw_module_t **)&m_pPowerModule)) {
-        ALOGE("%s: %s module not found", __func__, POWER_HARDWARE_MODULE_ID);
-    }
-#endif
 
     memset(mDefOngoingJobs, 0, sizeof(mDefOngoingJobs));
     memset(&mJpegMetadata, 0, sizeof(mJpegMetadata));
@@ -1662,6 +1777,12 @@ QCamera2HardwareInterface::QCamera2HardwareInterface(uint32_t cameraId)
 
     mDeferredWorkThread.launch(deferredWorkRoutine, this);
     mDeferredWorkThread.sendCmd(CAMERA_CMD_TYPE_START_DATA_PROC, FALSE, FALSE);
+
+    pthread_mutex_init(&mGrallocLock, NULL);
+    mEnqueuedBuffers = 0;
+    mFrameSkipStart = 0;
+    mFrameSkipEnd = 0;
+    mLastPreviewFrameID = 0;
 
     //Load and read GPU library.
     lib_surface_utils = NULL;
@@ -1676,9 +1797,6 @@ QCamera2HardwareInterface::QCamera2HardwareInterface(uint32_t cameraId)
          }
          dlclose(lib_surface_utils);
     }
-
-    pthread_mutex_init(&mGrallocLock, NULL);
-    mEnqueuedBuffers = 0;
 }
 
 /*===========================================================================
@@ -1692,7 +1810,8 @@ QCamera2HardwareInterface::QCamera2HardwareInterface(uint32_t cameraId)
  *==========================================================================*/
 QCamera2HardwareInterface::~QCamera2HardwareInterface()
 {
-    CDBG_HIGH("%s: E", __func__);
+    LOGH("E");
+
     mDeferredWorkThread.sendCmd(CAMERA_CMD_TYPE_STOP_DATA_PROC, TRUE, TRUE);
     mDeferredWorkThread.exit();
 
@@ -1701,20 +1820,27 @@ QCamera2HardwareInterface::~QCamera2HardwareInterface()
         mMetadataMem = NULL;
     }
 
+    m_perfLockMgr.acquirePerfLock(PERF_LOCK_CLOSE_CAMERA);
     lockAPI();
     m_smThreadActive = false;
     unlockAPI();
     m_stateMachine.releaseThread();
     closeCamera();
+    m_perfLockMgr.releasePerfLock(PERF_LOCK_CLOSE_CAMERA);
+
+    if (m_pFovControl) {
+        delete m_pFovControl;
+        m_pFovControl = NULL;
+    }
+
     pthread_mutex_destroy(&m_lock);
     pthread_cond_destroy(&m_cond);
     pthread_mutex_destroy(&m_evtLock);
     pthread_cond_destroy(&m_evtCond);
-    pthread_mutex_destroy(&m_parm_lock);
     pthread_mutex_destroy(&m_int_lock);
     pthread_cond_destroy(&m_int_cond);
     pthread_mutex_destroy(&mGrallocLock);
-    CDBG_HIGH("%s: X", __func__);
+    LOGH("X");
 }
 
 /*===========================================================================
@@ -1758,26 +1884,48 @@ uint32_t QCamera2HardwareInterface::deferPPInit()
  *==========================================================================*/
 int QCamera2HardwareInterface::openCamera(struct hw_device_t **hw_device)
 {
-    KPI_ATRACE_CALL();
+    KPI_ATRACE_CAMSCOPE_CALL(CAMSCOPE_HAL1_OPENCAMERA);
     int rc = NO_ERROR;
+    int enable_fdleak=0;
+    int enable_memleak=0;
+    char prop[PROPERTY_VALUE_MAX];
     if (mCameraOpened) {
         *hw_device = NULL;
+        LOGE("Permission Denied");
         return PERMISSION_DENIED;
     }
-    ALOGI("[KPI Perf] %s: E PROFILE_OPEN_CAMERA camera id %d",
-        __func__,mCameraId);
+    LOGI("[KPI Perf]: E PROFILE_OPEN_CAMERA camera id %d",
+            mCameraId);
+
+    m_perfLockMgr.acquirePerfLock(PERF_LOCK_OPEN_CAMERA);
+#ifdef FDLEAK_FLAG
+    property_get("persist.vendor.camera.fdleak.enable", prop, "0");
+    enable_fdleak = atoi(prop);
+    if (enable_fdleak) {
+       LOGI("fdleak tool is enable for camera hal");
+    hal_debug_enable_fdleak_trace();
+    }
+#endif
+#ifdef MEMLEAK_FLAG
+    property_get("persist.vendor.camera.memleak.enable", prop, "0");
+    enable_memleak = atoi(prop);
+    if (enable_memleak) {
+       LOGI("memleak tool is enable for camera hal");
+    hal_debug_enable_memleak_trace();
+    }
+#endif
     rc = openCamera();
     if (rc == NO_ERROR){
         *hw_device = &mCameraDevice.common;
         if (m_thermalAdapter.init(this) != 0) {
-          ALOGE("Init thermal adapter failed");
+          LOGW("Init thermal adapter failed");
         }
     }
     else
         *hw_device = NULL;
 
-    ALOGI("[KPI Perf] %s: X PROFILE_OPEN_CAMERA camera id %d, rc: %d",
-        __func__,mCameraId, rc);
+    LOGI("[KPI Perf]: X PROFILE_OPEN_CAMERA camera id %d, rc: %d",
+            mCameraId, rc);
 
     return rc;
 }
@@ -1799,14 +1947,25 @@ int QCamera2HardwareInterface::openCamera()
     char value[PROPERTY_VALUE_MAX];
 
     if (mCameraHandle) {
-        ALOGE("Failure: Camera already opened");
+        LOGE("Failure: Camera already opened");
         return ALREADY_EXISTS;
+    }
+
+    rc = QCameraFlash::getInstance().reserveFlashForCamera(mCameraId);
+    if (rc < 0) {
+        LOGE("Failed to reserve flash for camera id: %d",
+                mCameraId);
+        return UNKNOWN_ERROR;
     }
 
     // alloc param buffer
     DeferWorkArgs args;
     memset(&args, 0, sizeof(args));
     mParamAllocJob = queueDeferredWork(CMD_DEF_PARAM_ALLOC, args);
+    if (mParamAllocJob == 0) {
+        LOGE("Failed queueing PARAM_ALLOC job");
+        return -ENOMEM;
+    }
 
     if (gCamCapability[mCameraId] != NULL) {
         // allocate metadata buffers
@@ -1825,36 +1984,59 @@ int QCamera2HardwareInterface::openCamera()
 
         mMetadataAllocJob = queueDeferredWork(CMD_DEF_METADATA_ALLOC, args);
         if (mMetadataAllocJob == 0) {
-            CDBG_HIGH("%s: Failed to allocate param buffer", __func__);
+            LOGE("Failed to allocate metadata buffer");
+            rc = -ENOMEM;
+            goto error_exit1;
         }
 
         rc = camera_open((uint8_t)mCameraId, &mCameraHandle);
         if (rc) {
-            ALOGE("camera_open failed. rc = %d, mCameraHandle = %p", rc, mCameraHandle);
-            return rc;
+            LOGE("camera_open failed. rc = %d, mCameraHandle = %p",
+                     rc, mCameraHandle);
+            goto error_exit2;
         }
 
         mCameraHandle->ops->register_event_notify(mCameraHandle->camera_handle,
                 camEvtHandle,
                 (void *) this);
     } else {
-        CDBG_HIGH("%s: Capabilities are not initialized. Initializing them now.", __func__);
+        LOGH("Capabilities not inited, initializing now.");
 
         rc = camera_open((uint8_t)mCameraId, &mCameraHandle);
         if (rc) {
-            ALOGE("camera_open failed. rc = %d, mCameraHandle = %p", rc, mCameraHandle);
-            return rc;
+            LOGE("camera_open failed. rc = %d, mCameraHandle = %p",
+                     rc, mCameraHandle);
+            goto error_exit2;
         }
 
         if(NO_ERROR != initCapabilities(mCameraId,mCameraHandle)) {
-            ALOGE("initCapabilities failed.");
+            LOGE("initCapabilities failed.");
             rc = UNKNOWN_ERROR;
-            goto error_exit;
+            goto error_exit3;
         }
 
         mCameraHandle->ops->register_event_notify(mCameraHandle->camera_handle,
                 camEvtHandle,
                 (void *) this);
+    }
+    mBundledSnapshot = 0;
+    mActiveCameras = MM_CAMERA_TYPE_MAIN;
+    mFallbackMode = CAM_NO_FALLBACK;
+    if (isDualCamera()) {
+        mActiveCameras |= MM_CAMERA_TYPE_AUX;
+
+        // Create and initialize FOV-control object
+        m_pFovControl = QCameraFOVControl::create(gCamCapability[mCameraId]->main_cam_cap,
+                gCamCapability[mCameraId]->aux_cam_cap);
+        if (m_pFovControl) {
+            *gCamCapability[mCameraId] = m_pFovControl->consolidateCapabilities(
+                    gCamCapability[mCameraId]->main_cam_cap,
+                    gCamCapability[mCameraId]->aux_cam_cap);
+        } else {
+            LOGE("FOV-control: Failed to create an object");
+            rc = NO_MEMORY;
+            goto error_exit3;
+        }
     }
 
     // Init params in the background
@@ -1866,6 +2048,11 @@ int QCamera2HardwareInterface::openCamera()
     // this task.
     memset(&args, 0, sizeof(args));
     mParamInitJob = queueDeferredWork(CMD_DEF_PARAM_INIT, args);
+    if (mParamInitJob == 0) {
+        LOGE("Failed queuing PARAM_INIT job");
+        rc = -ENOMEM;
+        goto error_exit3;
+    }
 
     mCameraOpened = true;
 
@@ -1887,7 +2074,7 @@ int QCamera2HardwareInterface::openCamera()
 
     // Setprop to decide the time source (whether boottime or monotonic).
     // By default, use monotonic time.
-    property_get("persist.camera.time.monotonic", value, "1");
+    property_get("persist.vendor.camera.time.monotonic", value, "1");
     mBootToMonoTimestampOffset = 0;
     if (atoi(value) == 1) {
         // if monotonic is set, then need to use time in monotonic.
@@ -1900,15 +2087,27 @@ int QCamera2HardwareInterface::openCamera()
         // words, camera device shouldn't be open during CPU suspend.
         mBootToMonoTimestampOffset = getBootToMonoTimeOffset();
     }
-    CDBG_HIGH("mBootToMonoTimestampOffset = %lld", mBootToMonoTimestampOffset);
+    LOGH("mBootToMonoTimestampOffset = %lld", mBootToMonoTimestampOffset);
 
+    memset(value, 0, sizeof(value));
+    property_get("persist.vendor.camera.depth.focus.cb", value, "1");
+    bDepthAFCallbacks = atoi(value);
+
+    memset(value, 0, sizeof(value));
+    property_get("persist.vendor.camera.cache.optimize", value, "1");
+    m_bOptimizeCacheOps = atoi(value);
     return NO_ERROR;
-error_exit:
+
+error_exit3:
     if(mJpegClientHandle) {
         deinitJpegHandle();
     }
     mCameraHandle->ops->close_camera(mCameraHandle->camera_handle);
     mCameraHandle = NULL;
+error_exit2:
+    waitDeferredWork(mMetadataAllocJob);
+error_exit1:
+    waitDeferredWork(mParamAllocJob);
     return rc;
 
 }
@@ -1920,26 +2119,18 @@ error_exit:
  *
  * PARAMETERS :
  *   @sync        :indicates whether syncing is On or Off
- *   @sessionid  :session id for other camera session
  *
  * RETURN     : int32_t type of status
  *              NO_ERROR  -- success
  *              none-zero failure code
  *==========================================================================*/
-int QCamera2HardwareInterface::bundleRelatedCameras(bool syncOn,
-            uint32_t sessionid)
+int QCamera2HardwareInterface::bundleRelatedCameras(bool syncOn)
 {
-    CDBG("%s: bundleRelatedCameras sync %d with sessionid %d", __func__,
-            syncOn, sessionid);
-
-    pthread_mutex_lock(&m_parm_lock);
-    int32_t rc = mParameters.bundleRelatedCameras(syncOn, sessionid);
+    int32_t rc = mParameters.bundleRelatedCameras(syncOn);
     if (rc != NO_ERROR) {
-        ALOGE("%s: bundleRelatedCameras failed %d", __func__, rc);
-        pthread_mutex_unlock(&m_parm_lock);
+        LOGE("bundleRelatedCameras failed %d", rc);
         return rc;
     }
-    pthread_mutex_unlock(&m_parm_lock);
     return rc;
 }
 
@@ -1962,12 +2153,43 @@ int QCamera2HardwareInterface::getCameraSessionId(uint32_t* session_id)
     if(session_id != NULL) {
         rc = mCameraHandle->ops->get_session_id(mCameraHandle->camera_handle,
                 session_id);
-        CDBG("%s: Getting Camera Session Id %d", __func__, *session_id);
+        LOGD("Getting Camera Session Id %d", *session_id);
     } else {
-        ALOGE("%s:Session Id is Null", __func__);
+        LOGE("Session Id is Null");
         return UNKNOWN_ERROR;
     }
     return rc;
+}
+
+/*===========================================================================
+ * FUNCTION   : isFrameSyncEnabled
+ *
+ * DESCRIPTION: returns whether frame sync is enabled
+ *
+ * PARAMETERS : none
+ *
+ * RETURN     : bool indicating whether frame sync is enabled
+ *==========================================================================*/
+bool QCamera2HardwareInterface::isFrameSyncEnabled(void)
+{
+    return mParameters.isFrameSyncEnabled();
+}
+
+/*===========================================================================
+ * FUNCTION   : setFrameSyncEnabled
+ *
+ * DESCRIPTION: sets whether frame sync is enabled
+ *
+ * PARAMETERS :
+ *   @enable  : flag whether to enable or disable frame sync
+ *
+ * RETURN     : int32_t type of status
+ *              NO_ERROR  -- success
+ *              none-zero failure code
+ *==========================================================================*/
+int32_t QCamera2HardwareInterface::setFrameSyncEnabled(bool enable)
+{
+    return mParameters.setFrameSyncEnabled(enable);
 }
 
 /*===========================================================================
@@ -2019,7 +2241,7 @@ int32_t QCamera2HardwareInterface::setRelatedCamSyncInfo(
  *==========================================================================*/
 bool QCamera2HardwareInterface::getMpoComposition(void)
 {
-    CDBG_HIGH("%s: MpoComposition:%d ", __func__, m_bMpoEnabled);
+    LOGH("MpoComposition:%d ", m_bMpoEnabled);
     return m_bMpoEnabled;
 }
 
@@ -2051,7 +2273,7 @@ int32_t QCamera2HardwareInterface::setMpoComposition(bool enable)
             !mFlashNeeded &&
             !isLongshotEnabled()) {
         m_bMpoEnabled = enable;
-        CDBG_HIGH("%s: MpoComposition:%d ", __func__, m_bMpoEnabled);
+        LOGH("MpoComposition:%d ", m_bMpoEnabled);
         return NO_ERROR;
     } else {
         return BAD_TYPE;
@@ -2086,11 +2308,7 @@ bool QCamera2HardwareInterface::getRecordingHintValue(void)
  *==========================================================================*/
 int32_t QCamera2HardwareInterface::setRecordingHintValue(int32_t value)
 {
-    int32_t rc = NO_ERROR;
-    pthread_mutex_lock(&m_parm_lock);
-    rc = mParameters.updateRecordingHintValue(value);
-    pthread_mutex_unlock(&m_parm_lock);
-    return rc;
+    return mParameters.updateRecordingHintValue(value);
 }
 
 /*===========================================================================
@@ -2109,14 +2327,12 @@ int QCamera2HardwareInterface::closeCamera()
     int rc = NO_ERROR;
     int i;
     char value[PROPERTY_VALUE_MAX];
-    CDBG_HIGH("%s: E", __func__);
+    LOGI("E");
     if (!mCameraOpened) {
         return NO_ERROR;
     }
-    ALOGI("[KPI Perf] %s: E PROFILE_CLOSE_CAMERA camera id %d",
-        __func__, mCameraId);
-
-    pthread_mutex_lock(&m_parm_lock);
+    LOGI("[KPI Perf]: E PROFILE_CLOSE_CAMERA camera id %d",
+             mCameraId);
 
     // set open flag to false
     mCameraOpened = false;
@@ -2126,8 +2342,6 @@ int QCamera2HardwareInterface::closeCamera()
 
     // deinit Parameters
     mParameters.deinit();
-
-    pthread_mutex_unlock(&m_parm_lock);
 
     // exit notifier
     m_cbNotifier.exit();
@@ -2182,13 +2396,117 @@ int QCamera2HardwareInterface::closeCamera()
         free(mExifParams.debug_params);
         mExifParams.debug_params = NULL;
     }
-    ALOGI("[KPI Perf] %s: X PROFILE_CLOSE_CAMERA camera id %d, rc: %d",
-        __func__, mCameraId, rc);
+
+    if (QCameraFlash::getInstance().releaseFlashFromCamera(mCameraId) != 0) {
+        LOGD("Failed to release flash for camera id: %d",
+                mCameraId);
+    }
+
+    LOGI("[KPI Perf]: X PROFILE_CLOSE_CAMERA camera id %d, rc: %d",
+         mCameraId, rc);
 
     return rc;
 }
 
 #define DATA_PTR(MEM_OBJ,INDEX) MEM_OBJ->getPtr( INDEX )
+
+
+/*===========================================================================
+ * FUNCTION   : getCapabilities
+ *
+ * DESCRIPTION: query camera capability from back-end
+ *
+ * PARAMETERS :
+ *   @ops        : mm-interface ops structure
+ *   @cam_handle  : camera handle for which we need capability
+ *
+ * RETURN     : ptr type of capability structure
+ *              capability for success
+ *              NULL for failure
+ *==========================================================================*/
+cam_capability_t *QCamera2HardwareInterface::getCapabilities(mm_camera_ops_t *ops,
+        uint32_t cam_handle)
+{
+    ATRACE_CAMSCOPE_CALL(CAMSCOPE_HAL1_GET_CAP);
+    int rc = NO_ERROR;
+    QCameraHeapMemory *capabilityHeap = NULL;
+    cam_capability_t *cap_ptr = NULL;
+
+    if (ops == NULL) {
+        LOGE("Invalid arguments");
+        return NULL;
+    }
+
+    capabilityHeap = new QCameraHeapMemory(1);
+    if (capabilityHeap == NULL) {
+        LOGE("creation of capabilityHeap failed");
+        return NULL;
+    }
+
+    /* Allocate memory for capability buffer */
+    rc = capabilityHeap->allocate(1, sizeof(cam_capability_t));
+    if(rc != OK) {
+        LOGE("No memory for capability");
+        goto allocate_failed;
+    }
+
+    /* Map memory for capability buffer */
+    memset(DATA_PTR(capabilityHeap,0), 0, sizeof(cam_capability_t));
+
+    cam_buf_map_type_list bufMapList;
+    rc = QCameraBufferMaps::makeSingletonBufMapList(
+            CAM_MAPPING_BUF_TYPE_CAPABILITY,
+            0 /*stream id*/, 0 /*buffer index*/, -1 /*plane index*/,
+            0 /*cookie*/, capabilityHeap->getFd(0), sizeof(cam_capability_t),
+            bufMapList, capabilityHeap->getPtr(0));
+
+    if (rc == NO_ERROR) {
+        rc = ops->map_bufs(cam_handle,
+                &bufMapList);
+    }
+    if(rc < 0) {
+        LOGE("failed to map capability buffer");
+        goto map_failed;
+    }
+
+    /* Query Capability */
+    rc = ops->query_capability(cam_handle);
+    if(rc < 0) {
+        LOGE("failed to query capability");
+        rc = FAILED_TRANSACTION;
+        goto query_failed;
+    }
+
+    cap_ptr = (cam_capability_t *)malloc(sizeof(cam_capability_t));
+    if (cap_ptr == NULL) {
+        LOGE("out of memory");
+        rc = NO_MEMORY;
+        goto query_failed;
+    }
+
+    memset(cap_ptr, 0, sizeof(cam_capability_t));
+    memcpy(cap_ptr, DATA_PTR(capabilityHeap, 0), sizeof(cam_capability_t));
+
+    int index;
+    for (index = 0; index < CAM_ANALYSIS_INFO_MAX; index++) {
+        cam_analysis_info_t *p_analysis_info = &cap_ptr->analysis_info[index];
+        p_analysis_info->analysis_padding_info.offset_info.offset_x = 0;
+        p_analysis_info->analysis_padding_info.offset_info.offset_y = 0;
+    }
+
+query_failed:
+    ops->unmap_buf(cam_handle, CAM_MAPPING_BUF_TYPE_CAPABILITY);
+map_failed:
+    capabilityHeap->deallocate();
+allocate_failed:
+    delete capabilityHeap;
+
+    if (rc != NO_ERROR) {
+        return NULL;
+    } else {
+        return cap_ptr;
+    }
+}
 
 /*===========================================================================
  * FUNCTION   : initCapabilities
@@ -2205,63 +2523,53 @@ int QCamera2HardwareInterface::closeCamera()
 int QCamera2HardwareInterface::initCapabilities(uint32_t cameraId,
         mm_camera_vtbl_t *cameraHandle)
 {
-    ATRACE_CALL();
-    int rc = NO_ERROR;
-    QCameraHeapMemory *capabilityHeap = NULL;
+    ATRACE_CAMSCOPE_CALL(CAMSCOPE_HAL1_INIT_CAP);
+    int rc = 0;
+    uint32_t handle = 0;
 
-    /* Allocate memory for capability buffer */
-    capabilityHeap = new QCameraHeapMemory(QCAMERA_ION_USE_CACHE);
-    rc = capabilityHeap->allocate(1, sizeof(cam_capability_t), NON_SECURE);
-    if(rc != OK) {
-        ALOGE("%s: No memory for cappability", __func__);
-        goto allocate_failed;
+    rc = camera_open((uint8_t)cameraId, &cameraHandle);
+    if (rc) {
+        LOGE("camera_open failed. rc = %d", rc);
+        goto open_failed;
+    }
+    if (!cameraHandle) {
+        LOGE("camera_open failed. cameraHandle = %p", cameraHandle);
+        goto open_failed;
     }
 
-    /* Map memory for capability buffer */
-    memset(DATA_PTR(capabilityHeap,0), 0, sizeof(cam_capability_t));
-
-    cam_buf_map_type_list bufMapList;
-    rc = QCameraBufferMaps::makeSingletonBufMapList(
-            CAM_MAPPING_BUF_TYPE_CAPABILITY,
-            0 /*stream id*/, 0 /*buffer index*/, -1 /*plane index*/,
-            0 /*cookie*/, capabilityHeap->getFd(0), sizeof(cam_capability_t),
-            bufMapList);
-
-    if (rc == NO_ERROR) {
-        rc = cameraHandle->ops->map_bufs(cameraHandle->camera_handle,
-                &bufMapList);
+    handle = get_main_camera_handle(cameraHandle->camera_handle);
+    gCamCapability[cameraId] = getCapabilities(cameraHandle->ops, handle);
+    if (gCamCapability[cameraId] == NULL) {
+        rc = FAILED_TRANSACTION;
+        goto failed_op;
     }
 
-    if(rc < 0) {
-        ALOGE("%s: failed to map capability buffer", __func__);
-        goto map_failed;
+    gCamCapability[cameraId]->camera_index = cameraId;
+    if (is_dual_camera_by_idx(cameraId)) {
+        handle = get_aux_camera_handle(cameraHandle->camera_handle);
+        gCamCapability[cameraId]->aux_cam_cap =
+                getCapabilities(cameraHandle->ops, handle);
+        if (gCamCapability[cameraId]->aux_cam_cap == NULL) {
+            rc = FAILED_TRANSACTION;
+            free(gCamCapability[cameraId]);
+            goto failed_op;
+        }
+
+        // Copy the main camera capability to main_cam_cap struct
+        gCamCapability[cameraId]->main_cam_cap =
+                (cam_capability_t *)malloc(sizeof(cam_capability_t));
+        if (gCamCapability[cameraId]->main_cam_cap == NULL) {
+            LOGE("out of memory");
+            rc = NO_MEMORY;
+            goto failed_op;
+        }
+        memcpy(gCamCapability[cameraId]->main_cam_cap, gCamCapability[cameraId],
+                sizeof(cam_capability_t));
     }
-
-    /* Query Capability */
-    rc = cameraHandle->ops->query_capability(cameraHandle->camera_handle);
-    if(rc < 0) {
-        ALOGE("%s: failed to query capability",__func__);
-        goto query_failed;
-    }
-    gCamCapability[cameraId] =
-            (cam_capability_t *)malloc(sizeof(cam_capability_t));
-
-    if (!gCamCapability[cameraId]) {
-        ALOGE("%s: out of memory", __func__);
-        goto query_failed;
-    }
-    memcpy(gCamCapability[cameraId], DATA_PTR(capabilityHeap,0),
-                                        sizeof(cam_capability_t));
-
-    rc = NO_ERROR;
-
-query_failed:
-    cameraHandle->ops->unmap_buf(cameraHandle->camera_handle,
-                            CAM_MAPPING_BUF_TYPE_CAPABILITY);
-map_failed:
-    capabilityHeap->deallocate();
-    delete capabilityHeap;
-allocate_failed:
+failed_op:
+    cameraHandle->ops->close_camera(cameraHandle->camera_handle);
+    cameraHandle = NULL;
+open_failed:
     return rc;
 }
 
@@ -2281,7 +2589,7 @@ allocate_failed:
 int QCamera2HardwareInterface::getCapabilities(uint32_t cameraId,
         struct camera_info *info, cam_sync_type_t *p_cam_type)
 {
-    ATRACE_CALL();
+    ATRACE_CAMSCOPE_CALL(CAMSCOPE_HAL1_GET_CAP);
     int rc = NO_ERROR;
     struct  camera_info *p_info = NULL;
     pthread_mutex_lock(&gCamLock);
@@ -2310,22 +2618,66 @@ cam_capability_t* QCamera2HardwareInterface::getCamHalCapabilities()
 }
 
 /*===========================================================================
+ * FUNCTION   : getBufNumForAux
+ *
+ * DESCRIPTION: return number of stream buffers needed for aux camera given stream type
+ *
+ * PARAMETERS :
+ *   @stream_type  : type of stream
+ *
+ * RETURN     : number of buffers needed
+ * NOTE     :  Based on the use cases and auxillary camera type,
+                    we can decide buffer count
+ *==========================================================================*/
+uint8_t QCamera2HardwareInterface::getBufNumForAux(cam_stream_type_t stream_type)
+{
+    if (!isDualCamera()) {
+        return 0;
+    }
+
+    uint8_t bufferCnt = 1;
+    switch (stream_type) {
+    case CAM_STREAM_TYPE_PREVIEW:
+    case CAM_STREAM_TYPE_VIDEO:
+    case CAM_STREAM_TYPE_SNAPSHOT:
+    case CAM_STREAM_TYPE_METADATA:
+    case CAM_STREAM_TYPE_CALLBACK:
+    case CAM_STREAM_TYPE_ANALYSIS:
+    case CAM_STREAM_TYPE_POSTVIEW:
+    case CAM_STREAM_TYPE_RAW:
+    case CAM_STREAM_TYPE_OFFLINE_PROC:
+    case CAM_STREAM_TYPE_DEFAULT:
+    case CAM_STREAM_TYPE_MAX:
+        //For wide & tele, we use same buffer count primary and aux streams.
+        bufferCnt = getBufNumRequired(stream_type);
+        break;
+    default:
+        break;
+    }
+    LOGH("Buffer Cnt for Aux Camera : %d", bufferCnt);
+    return bufferCnt;
+}
+
+/*===========================================================================
  * FUNCTION   : getBufNumRequired
  *
  * DESCRIPTION: return number of stream buffers needed for given stream type
  *
  * PARAMETERS :
  *   @stream_type  : type of stream
+ *   @cam_type:  specifies camera type
  *
  * RETURN     : number of buffers needed
  *==========================================================================*/
-uint8_t QCamera2HardwareInterface::getBufNumRequired(cam_stream_type_t stream_type)
+uint8_t QCamera2HardwareInterface::getBufNumRequired(
+        cam_stream_type_t stream_type, uint32_t cam_type)
 {
     int bufferCnt = 0;
     int minCaptureBuffers = mParameters.getNumOfSnapshots();
     char value[PROPERTY_VALUE_MAX];
     bool raw_yuv = false;
     int persist_cnt = 0;
+    int minPrevFps, maxPrevFps;
 
     int zslQBuffers = mParameters.getZSLQueueDepth();
 
@@ -2339,11 +2691,12 @@ uint8_t QCamera2HardwareInterface::getBufNumRequired(cam_stream_type_t stream_ty
                        EXTRA_ZSL_PREVIEW_STREAM_BUF;
 
     int minUndequeCount = 0;
-    if (!isNoDisplayMode()) {
+
+    if (!isNoDisplayMode(cam_type)) {
         if(mPreviewWindow != NULL) {
             if (mPreviewWindow->get_min_undequeued_buffer_count(mPreviewWindow,&minUndequeCount)
                 != 0) {
-                ALOGE("get_min_undequeued_buffer_count  failed");
+                LOGW("get_min_undequeued_buffer_count  failed");
                 //TODO: hardcoded because MIN_UNDEQUEUED_BUFFERS not defined
                 //minUndequeCount = BufferQueue::MIN_UNDEQUEUED_BUFFERS;
                 minUndequeCount = MIN_UNDEQUEUED_BUFFERS;
@@ -2358,16 +2711,22 @@ uint8_t QCamera2HardwareInterface::getBufNumRequired(cam_stream_type_t stream_ty
         if (minUndequeCount != MIN_UNDEQUEUED_BUFFERS) {
             // minUndequeCount from valid preview window != hardcoded MIN_UNDEQUEUED_BUFFERS
             // and so change the MACRO as per minUndequeCount
-            ALOGE("%s: ***ERROR Case*** minUndequeCount(%d) != hardcoded value(%d)",
-                    __func__, minUndequeCount, MIN_UNDEQUEUED_BUFFERS);
+            LOGW("WARNING : minUndequeCount(%d) != hardcoded value(%d)",
+                     minUndequeCount, MIN_UNDEQUEUED_BUFFERS);
         }
     }
 
+    LOGD("cam_type: %x minCaptureBuffers = %d zslQBuffers = %d minCircularBufNum = %d"
+            "maxStreamBuf = %d minUndequeCount = %d", cam_type,
+            minCaptureBuffers, zslQBuffers, minCircularBufNum,
+            maxStreamBuf, minUndequeCount);
     // Get buffer count for the particular stream type
     switch (stream_type) {
     case CAM_STREAM_TYPE_PREVIEW:
         {
-            if (mParameters.isZSLMode()) {
+            if (isSecureMode()) {
+                bufferCnt = mParameters.getSecureQueueDepth();
+            } else if (mParameters.isZSLMode()) {
                 // We need to add two extra streming buffers to add
                 // flexibility in forming matched super buf in ZSL queue.
                 // with number being 'zslQBuffers + minCircularBufNum'
@@ -2378,6 +2737,14 @@ uint8_t QCamera2HardwareInterface::getBufNumRequired(cam_stream_type_t stream_ty
                         mParameters.getNumOfExtraBuffersForImageProc() +
                         mParameters.getNumOfExtraBuffersForPreview() +
                         mParameters.getNumOfExtraHDRInBufsIfNeeded();
+                if (isDualCamera()) {
+                    bufferCnt += zslQBuffers;
+                    if ((mParameters.getHalPPType() == CAM_HAL_PP_TYPE_BOKEH) &&
+                            (bufferCnt < CAMERA_BOKEH_MODE_MIN_BUFS)) {
+                        // Bokeh mode would need more buffer to prevent preview starvation
+                        bufferCnt = CAMERA_BOKEH_MODE_MIN_BUFS;
+                    }
+                }
             } else {
                 bufferCnt = CAMERA_MIN_STREAMING_BUFFERS +
                         mParameters.getMaxUnmatchedFramesInQueue() +
@@ -2387,10 +2754,22 @@ uint8_t QCamera2HardwareInterface::getBufNumRequired(cam_stream_type_t stream_ty
             if (bufferCnt > CAMERA_ISP_PING_PONG_BUFFERS )
                 bufferCnt -= CAMERA_ISP_PING_PONG_BUFFERS;
 
+            // Extra ZSL preview frames are not needed for HFR case.
+            // Thumbnail will not be derived from preview for HFR live snapshot case.
+            if ((mParameters.getRecordingHintValue() == true)
+                    && (!mParameters.isHfrMode())) {
+                bufferCnt += EXTRA_ZSL_PREVIEW_STREAM_BUF;
+            }
+            //Adding Extra preview buffers for 60FPS usecase.
+            mParameters.getPreviewFpsRange(&minPrevFps, &maxPrevFps);
+            if (maxPrevFps > CAMERA_DEFAULT_FPS) {
+                bufferCnt += CAMERA_MIN_DISPLAY_BUFFERS;
+            }
+
             // Add the display minUndequeCount count on top of camera requirement
             bufferCnt += minUndequeCount;
 
-            property_get("persist.camera.preview_yuv", value, "0");
+            property_get("persist.vendor.camera.preview_yuv", value, "0");
             persist_cnt = atoi(value);
             if ((persist_cnt < CAM_MAX_NUM_BUFS_PER_STREAM)
                     && (bufferCnt < persist_cnt)) {
@@ -2420,8 +2799,7 @@ uint8_t QCamera2HardwareInterface::getBufNumRequired(cam_stream_type_t stream_ty
                     // Single ZSL snapshot case
                     bufferCnt = zslQBuffers + CAMERA_MIN_STREAMING_BUFFERS +
                             mParameters.getNumOfExtraBuffersForImageProc();
-                }
-                else {
+                } else {
                     // ZSL Burst or Longshot case
                     bufferCnt = zslQBuffers + minCircularBufNum +
                             mParameters.getNumOfExtraBuffersForImageProc();
@@ -2429,6 +2807,9 @@ uint8_t QCamera2HardwareInterface::getBufNumRequired(cam_stream_type_t stream_ty
                 if (getSensorType() == CAM_SENSOR_YUV && bufferCnt > CAMERA_ISP_PING_PONG_BUFFERS) {
                     //ISP allocates native buffers in YUV case
                     bufferCnt -= CAMERA_ISP_PING_PONG_BUFFERS;
+                }
+                if (isDualCamera()) {
+                    bufferCnt += zslQBuffers;
                 }
             } else {
                 bufferCnt = minCaptureBuffers +
@@ -2443,12 +2824,10 @@ uint8_t QCamera2HardwareInterface::getBufNumRequired(cam_stream_type_t stream_ty
         }
         break;
     case CAM_STREAM_TYPE_RAW:
-        property_get("persist.camera.raw_yuv", value, "0");
+        property_get("persist.vendor.camera.raw_yuv", value, "0");
         raw_yuv = atoi(value) > 0 ? true : false;
 
-        if (isRdiMode() || raw_yuv) {
-            CDBG_HIGH("RDI_DEBUG %s[%d]: CAM_STREAM_TYPE_RAW",
-              __func__, __LINE__);
+        if (isRdiMode() || raw_yuv || isSecureMode() || mParameters.getRawZsl()) {
             bufferCnt = zslQBuffers + minCircularBufNum;
         } else if (mParameters.isZSLMode()) {
             bufferCnt = zslQBuffers + minCircularBufNum;
@@ -2468,13 +2847,19 @@ uint8_t QCamera2HardwareInterface::getBufNumRequired(cam_stream_type_t stream_ty
             }
         }
 
-        property_get("persist.camera.preview_raw", value, "0");
+        if (isSecureMode() && isRdiMode()) {
+            //Redefine buffer count for Gralloc based Secure RDI and add
+            //the preview window minUndequeCount count on top of camera requirement
+            bufferCnt = mParameters.getSecureQueueDepth() + minUndequeCount;
+        }
+
+        property_get("persist.vendor.camera.preview_raw", value, "0");
         persist_cnt = atoi(value);
         if ((persist_cnt < CAM_MAX_NUM_BUFS_PER_STREAM)
                 && (bufferCnt < persist_cnt)) {
             bufferCnt = persist_cnt;
         }
-        property_get("persist.camera.video_raw", value, "0");
+        property_get("persist.vendor.camera.video_raw", value, "0");
         persist_cnt = atoi(value);
         if ((persist_cnt < CAM_MAX_NUM_BUFS_PER_STREAM)
                 && (bufferCnt < persist_cnt)) {
@@ -2485,8 +2870,17 @@ uint8_t QCamera2HardwareInterface::getBufNumRequired(cam_stream_type_t stream_ty
     case CAM_STREAM_TYPE_VIDEO:
         {
             if (mParameters.getBufBatchCount()) {
-                bufferCnt = CAMERA_MIN_VIDEO_BATCH_BUFFERS;
+                //Video Buffer in case of HFR or camera batching..
+                bufferCnt = CAMERA_MIN_CAMERA_BATCH_BUFFERS;
+            } else if (mParameters.getVideoBatchSize()) {
+                //Video Buffer count only for HAL to HAL batching.
+                bufferCnt = (CAMERA_MIN_VIDEO_BATCH_BUFFERS
+                        * mParameters.getVideoBatchSize());
+                if (bufferCnt < CAMERA_MIN_VIDEO_BUFFERS) {
+                    bufferCnt = CAMERA_MIN_VIDEO_BUFFERS;
+                }
             } else {
+                // No batching enabled.
                 bufferCnt = CAMERA_MIN_VIDEO_BUFFERS;
             }
 
@@ -2496,10 +2890,13 @@ uint8_t QCamera2HardwareInterface::getBufNumRequired(cam_stream_type_t stream_ty
             mParameters.getStreamDimension(CAM_STREAM_TYPE_VIDEO, dim);
             if (is4k2kResolution(&dim)) {
                  //get additional buffer count
-                 property_get("vidc.enc.dcvs.extra-buff-count", value, "0");
-                 bufferCnt += atoi(value);
+                 property_get("vendor.vidc.enc.dcvs.extra-buff-count", value, "0");
+                 persist_cnt = atoi(value);
+                 if (persist_cnt >= 0 &&
+                     persist_cnt < CAM_MAX_NUM_BUFS_PER_STREAM) {
+                     bufferCnt += persist_cnt;
+                 }
             }
-            ALOGI("Buffer count is %d, width / height (%d/%d) ", bufferCnt, dim.width, dim.height);
         }
         break;
     case CAM_STREAM_TYPE_METADATA:
@@ -2511,6 +2908,9 @@ uint8_t QCamera2HardwareInterface::getBufNumRequired(cam_stream_type_t stream_ty
                             mParameters.getNumOfExtraHDROutBufsIfNeeded() +
                             mParameters.getNumOfExtraBuffersForImageProc() +
                             EXTRA_ZSL_PREVIEW_STREAM_BUF;
+                if (isDualCamera()) {
+                    bufferCnt += zslQBuffers;
+                }
             } else {
                 bufferCnt = minCaptureBuffers +
                             mParameters.getNumOfExtraHDRInBufsIfNeeded() -
@@ -2526,6 +2926,7 @@ uint8_t QCamera2HardwareInterface::getBufNumRequired(cam_stream_type_t stream_ty
             if (CAMERA_MIN_METADATA_BUFFERS > bufferCnt) {
                 bufferCnt = CAMERA_MIN_METADATA_BUFFERS;
             }
+            bufferCnt += mParameters.getNumOfExtraEISBufsIfNeeded();
         }
         break;
     case CAM_STREAM_TYPE_OFFLINE_PROC:
@@ -2537,6 +2938,9 @@ uint8_t QCamera2HardwareInterface::getBufNumRequired(cam_stream_type_t stream_ty
             }
             if (mLongshotEnabled) {
                 bufferCnt = mParameters.getLongshotStages();
+            }
+            if(isDualCamera() && (mParameters.getHalPPType() == CAM_HAL_PP_TYPE_CLEARSIGHT)) {
+                bufferCnt = MIN_CLEARSIGHT_BUFS;
             }
         }
         break;
@@ -2551,14 +2955,107 @@ uint8_t QCamera2HardwareInterface::getBufNumRequired(cam_stream_type_t stream_ty
         break;
     }
 
-    CDBG("%s: Buffer count = %d for stream type = %d",__func__, bufferCnt, stream_type);
-    if (CAM_MAX_NUM_BUFS_PER_STREAM < bufferCnt) {
-        ALOGE("%s: Buffer count %d for stream type %d exceeds limit %d",
-                __func__, bufferCnt, stream_type, CAM_MAX_NUM_BUFS_PER_STREAM);
+    LOGH("Buffer count = %d for stream type = %d", bufferCnt, stream_type);
+    if (bufferCnt < 0 || CAM_MAX_NUM_BUFS_PER_STREAM < bufferCnt) {
+        LOGW("Buffer count %d for stream type %d exceeds limit %d",
+                 bufferCnt, stream_type, CAM_MAX_NUM_BUFS_PER_STREAM);
         return CAM_MAX_NUM_BUFS_PER_STREAM;
     }
 
     return (uint8_t)bufferCnt;
+}
+
+/*===========================================================================
+ * FUNCTION   : getStreamRefCount
+ *
+ * DESCRIPTION: return number of instance of stream of stream type
+ *
+ * PARAMETERS :
+ *   @stream_type  : type of stream
+ *   @cam_type      : Type of camera for this stream
+ *
+ * RETURN     : number of stream instances
+ * NOTE      :  Based on the use cases and auxillary camera type,
+                     we can decide stream reference count.
+                     For example in wide and tele use case, we duplicate all stream
+                     streams from premary to auxillary.
+ *==========================================================================*/
+uint8_t QCamera2HardwareInterface::getStreamRefCount(cam_stream_type_t stream_type,
+        uint32_t cam_type)
+{
+    uint8_t ref_cnt = 1;
+
+    if (cam_type != MM_CAMERA_DUAL_CAM) {
+        return ref_cnt;
+    }
+
+    switch (stream_type) {
+    case CAM_STREAM_TYPE_PREVIEW:
+    case CAM_STREAM_TYPE_SNAPSHOT:
+    case CAM_STREAM_TYPE_VIDEO:
+    case CAM_STREAM_TYPE_METADATA:
+    case CAM_STREAM_TYPE_ANALYSIS:
+    case CAM_STREAM_TYPE_CALLBACK:
+    case CAM_STREAM_TYPE_RAW:
+        if (isDualCamera()) {
+            ref_cnt++;
+        }
+        break;
+    case CAM_STREAM_TYPE_POSTVIEW:
+    case CAM_STREAM_TYPE_OFFLINE_PROC:
+    case CAM_STREAM_TYPE_DEFAULT:
+    case CAM_STREAM_TYPE_MAX:
+    default:
+        break;
+    }
+    return ref_cnt;
+}
+
+/*===========================================================================
+ * FUNCTION   : getCamHandleForChannel
+ *
+ * DESCRIPTION: return actual camera handle based on use case
+ *
+ * PARAMETERS :
+ *   @ch_type  : type of channel
+ *
+ * RETURN     : uint32_t type camera handle
+ * NOTE :  Based on the use cases and auxillary camera type, we can decide cam handle for channel.
+                 Incase, we want to avoid any channel for auxillary camera, we can decide here
+ *==========================================================================*/
+uint32_t QCamera2HardwareInterface::getCamHandleForChannel(qcamera_ch_type_enum_t ch_type)
+{
+    uint32_t handle = 0;
+    if (!isDualCamera()) {
+        return mCameraHandle->camera_handle;
+    }
+
+    /*Based on the use case, decide camera handle for channel*/
+    switch (ch_type) {
+    case QCAMERA_CH_TYPE_ZSL:
+    case QCAMERA_CH_TYPE_CAPTURE:
+    case QCAMERA_CH_TYPE_PREVIEW:
+    case QCAMERA_CH_TYPE_VIDEO:
+    case QCAMERA_CH_TYPE_SNAPSHOT:
+    case QCAMERA_CH_TYPE_RAW:
+    case QCAMERA_CH_TYPE_METADATA:
+    case QCAMERA_CH_TYPE_ANALYSIS:
+    case QCAMERA_CH_TYPE_CALLBACK:
+    case QCAMERA_CH_TYPE_MAX:
+    default:
+        handle = mCameraHandle->camera_handle;
+        break;
+    case QCAMERA_CH_TYPE_REPROCESSING:
+        if (!mParameters.isDCmAsymmetricSnapMode()) {
+            handle = get_main_camera_handle(mCameraHandle->camera_handle);
+        } else {
+            /*In Asymmetric mode, we create 2 reproc channels. But
+                     one stream is added per channel */
+            handle = mCameraHandle->camera_handle;
+        }
+        break;
+    }
+    return handle;
 }
 
 /*===========================================================================
@@ -2573,29 +3070,31 @@ uint8_t QCamera2HardwareInterface::getBufNumRequired(cam_stream_type_t stream_ty
  *   @scanline     : scanline of buffer
  *   @bufferCnt    : [IN/OUT] minimum num of buffers to be allocated.
  *                   could be modified during allocation if more buffers needed
+ *   @cam_type      : Camera type in case of dual camera
  *
  * RETURN     : ptr to a memory obj that holds stream buffers.
  *              NULL if failed
  *==========================================================================*/
 QCameraMemory *QCamera2HardwareInterface::allocateStreamBuf(
         cam_stream_type_t stream_type, size_t size, int stride, int scanline,
-        uint8_t &bufferCnt)
+        uint8_t &bufferCnt, uint32_t cam_type)
 {
     int rc = NO_ERROR;
     QCameraMemory *mem = NULL;
     bool bCachedMem = QCAMERA_ION_USE_CACHE;
     bool bPoolMem = false;
     char value[PROPERTY_VALUE_MAX];
-    property_get("persist.camera.mem.usepool", value, "1");
+    property_get("persist.vendor.camera.mem.usepool", value, "1");
     if (atoi(value) == 1) {
         bPoolMem = true;
     }
-
     // Allocate stream buffer memory object
     switch (stream_type) {
     case CAM_STREAM_TYPE_PREVIEW:
         {
-            if (isNoDisplayMode()) {
+            if (isNoDisplayMode(cam_type)) {
+                LOGH("Preview in No Display mode : cam_type: 0x%x stream_type: %d",
+                        cam_type, stream_type);
                 mem = new QCameraStreamMemory(mGetMemory,
                         mCallbackCookie,
                         bCachedMem,
@@ -2604,8 +3103,15 @@ QCameraMemory *QCamera2HardwareInterface::allocateStreamBuf(
             } else {
                 cam_dimension_t dim;
                 int minFPS, maxFPS;
-                QCameraGrallocMemory *grallocMemory =
-                    new QCameraGrallocMemory(mGetMemory, mCallbackCookie);
+                QCameraGrallocMemory *grallocMemory = NULL;
+                LOGH("Preview in Display mode : cam_type: 0x%x stream_type: %d",
+                        cam_type, stream_type);
+
+                if (isSecureMode()) {
+                    grallocMemory = new QCameraGrallocMemory(mGetMemory, mCallbackCookie, QCAMERA_MEM_TYPE_SECURE);
+                }else {
+                    grallocMemory = new QCameraGrallocMemory(mGetMemory, mCallbackCookie);
+                }
 
                 mParameters.getStreamDimension(stream_type, dim);
                 /* we are interested only in maxfps here */
@@ -2624,8 +3130,7 @@ QCameraMemory *QCamera2HardwareInterface::allocateStreamBuf(
                     grallocMemory->setWindowInfo(mPreviewWindow,
                             dim.width,dim.height, stride, scanline,
                             mParameters.getPreviewHalPixelFormat(),
-                            maxFPS, usage,
-                            isMonoCamera() ? CAM_FORMAT_Y_ONLY : 0);
+                            maxFPS, usage);
                     pthread_mutex_lock(&mGrallocLock);
                     if (bufferCnt > CAMERA_INITIAL_MAPPABLE_PREVIEW_BUFFERS) {
                         mEnqueuedBuffers = (bufferCnt -
@@ -2641,7 +3146,7 @@ QCameraMemory *QCamera2HardwareInterface::allocateStreamBuf(
         break;
     case CAM_STREAM_TYPE_POSTVIEW:
         {
-            if (isNoDisplayMode() || isPreviewRestartEnabled()) {
+            if (isNoDisplayMode(cam_type) || isPreviewRestartEnabled()) {
                 mem = new QCameraStreamMemory(mGetMemory, mCallbackCookie, bCachedMem);
             } else {
                 cam_dimension_t dim;
@@ -2663,13 +3168,66 @@ QCameraMemory *QCamera2HardwareInterface::allocateStreamBuf(
         break;
     case CAM_STREAM_TYPE_ANALYSIS:
     case CAM_STREAM_TYPE_SNAPSHOT:
-    case CAM_STREAM_TYPE_RAW:
     case CAM_STREAM_TYPE_OFFLINE_PROC:
         mem = new QCameraStreamMemory(mGetMemory,
                 mCallbackCookie,
                 bCachedMem,
                 (bPoolMem) ? &m_memoryPool : NULL,
                 stream_type);
+        break;
+    case CAM_STREAM_TYPE_RAW:
+        if(isSecureMode()) {
+            if (isRdiMode()) {
+                QCameraGrallocMemory *grallocMemory = NULL;
+                grallocMemory = new QCameraGrallocMemory(mGetMemory, mCallbackCookie, QCAMERA_MEM_TYPE_SECURE);
+                if (grallocMemory) {
+                    //min bufferCnt = CAMERA_MIN_SECURE_BUFFERS(2) + minUndequeCount(1)
+                    grallocMemory->setMappable(bufferCnt);
+
+                    cam_dimension_t dim;
+                    mParameters.getStreamDimension(CAM_STREAM_TYPE_RAW, dim);
+                    cam_format_t fmt;
+                    mParameters.getStreamFormat(CAM_STREAM_TYPE_RAW, fmt);
+                    int minFPS, maxFPS;
+                    mParameters.getPreviewFpsRange(&minFPS, &maxFPS);
+
+                    LOGD("StreamCfg: %dx%d, stride: %d, scanline: %d, fmt: %d, FPS: %d-%d",
+                        dim.width, dim.height, stride, scanline,
+                        fmt, minFPS, maxFPS);
+
+                    int gralloc_fmt = HAL_PIXEL_FORMAT_RAW_OPAQUE;
+                    int width = size;
+                    int height = 1;
+                    int actual_stride = stride;
+                    int actual_scanline = scanline;
+                    // we are interested only in minFPS here
+                    int fps = minFPS;
+                    int usage = 0;
+
+                    grallocMemory->setWindowInfo(mPreviewWindow,
+                        width, height, actual_stride, actual_scanline,
+                        gralloc_fmt, fps, usage);
+                    LOGD("setWindowInfo %dx%d, stride: %d, scanline: %d, fmt: %d, FPS: %d, usage: 0x%08X",
+                        width, height, actual_stride, actual_scanline,
+                        gralloc_fmt, fps, usage);
+                }
+                mem = grallocMemory;
+            } else {
+                mem = new QCameraStreamMemory(mGetMemory,
+                        mCallbackCookie,
+                        bCachedMem,
+                        (bPoolMem) ? &m_memoryPool : NULL,
+                        stream_type,
+                        QCAMERA_MEM_TYPE_SECURE);
+                LOGH("Allocating %d secure buffers of size %d ", bufferCnt, size);
+            }
+        } else {
+            mem = new QCameraStreamMemory(mGetMemory,
+                    mCallbackCookie,
+                    bCachedMem,
+                    (bPoolMem) ? &m_memoryPool : NULL,
+                    stream_type);
+        }
         break;
     case CAM_STREAM_TYPE_METADATA:
         {
@@ -2683,8 +3241,8 @@ QCameraMemory *QCamera2HardwareInterface::allocateStreamBuf(
                 if (numAdditionalBuffers > 0) {
                     rc = mem->allocateMore(numAdditionalBuffers, size);
                     if (rc != NO_ERROR) {
-                        ALOGE("%s: Failed to allocate additional buffers, "
-                                "but attempting to proceed.", __func__);
+                        LOGE("Failed to allocate additional buffers, "
+                                "but attempting to proceed.");
                     }
                 }
                 bufferCnt = mem->getCnt();
@@ -2704,18 +3262,49 @@ QCameraMemory *QCamera2HardwareInterface::allocateStreamBuf(
             else {
                 bCachedMem = QCAMERA_ION_USE_NOCACHE;
             }
-            CDBG_HIGH("%s: %s video buf allocated ", __func__,
-                    (bCachedMem == 0) ? "Uncached" : "Cached" );
-            QCameraVideoMemory *videoMemory =
-                    new QCameraVideoMemory(mGetMemory, mCallbackCookie, bCachedMem);
 
+            QCameraVideoMemory *videoMemory = NULL;
             int usage = 0;
             cam_format_t fmt;
-            mParameters.getStreamFormat(CAM_STREAM_TYPE_VIDEO,fmt);
-            if (mParameters.isUBWCEnabled() && (fmt == CAM_FORMAT_YUV_420_NV12_UBWC)) {
-                usage = private_handle_t::PRIV_FLAGS_UBWC_ALIGNED;
+
+            if (mParameters.getVideoBatchSize()) {
+                videoMemory = new QCameraVideoMemory(
+                        mGetMemory, mCallbackCookie, FALSE, QCAMERA_MEM_TYPE_BATCH);
+                if (videoMemory == NULL) {
+                    LOGE("Out of memory for video batching obj");
+                    return NULL;
+                }
+                mParameters.getStreamFormat(CAM_STREAM_TYPE_VIDEO,fmt);
+                if (mParameters.isUBWCEnabled() &&
+                        (fmt == CAM_FORMAT_YUV_420_NV12_UBWC)) {
+                    usage = private_handle_t::PRIV_FLAGS_UBWC_ALIGNED;
+                }
+                videoMemory->setVideoInfo(usage, fmt);
+                /*
+                *   numFDs = BATCH size
+                *  numInts = 5  // OFFSET, SIZE, USAGE, TIMESTAMP, FORMAT
+                */
+                rc = videoMemory->allocateMeta(
+                        CAMERA_MIN_VIDEO_BATCH_BUFFERS,
+                        mParameters.getVideoBatchSize());
+                if (rc < 0) {
+                    delete videoMemory;
+                    return NULL;
+                }
+            } else {
+                videoMemory =
+                        new QCameraVideoMemory(mGetMemory, mCallbackCookie, bCachedMem);
+                if (videoMemory == NULL) {
+                    LOGE("Out of memory for video obj");
+                    return NULL;
+                }
+                mParameters.getStreamFormat(CAM_STREAM_TYPE_VIDEO,fmt);
+                if (mParameters.isUBWCEnabled() &&
+                        (fmt == CAM_FORMAT_YUV_420_NV12_UBWC)) {
+                    usage = private_handle_t::PRIV_FLAGS_UBWC_ALIGNED;
+                }
+                videoMemory->setVideoInfo(usage, fmt);
             }
-            videoMemory->setVideoInfo(usage, fmt);
             mem = videoMemory;
         }
         break;
@@ -2736,20 +3325,15 @@ QCameraMemory *QCamera2HardwareInterface::allocateStreamBuf(
     }
 
     if (bufferCnt > 0) {
-        if (mParameters.isSecureMode() &&
-            (stream_type == CAM_STREAM_TYPE_RAW) &&
-            (mParameters.isRdiMode())) {
-            ALOGD("%s: Allocating %d secure buffers of size %d ", __func__, bufferCnt, size);
-            rc = mem->allocate(bufferCnt, size, SECURE);
-        } else {
-            rc = mem->allocate(bufferCnt, size, NON_SECURE);
-        }
+        rc = mem->allocate(bufferCnt, size);
         if (rc < 0) {
             delete mem;
             return NULL;
         }
         bufferCnt = mem->getCnt();
     }
+    LOGH("rc = %d type = %d count = %d size = %d cache = %d, pool = %d mEnqueuedBuffers = %d",
+            rc, stream_type, bufferCnt, size, bCachedMem, bPoolMem, mEnqueuedBuffers);
     return mem;
 }
 
@@ -2798,7 +3382,7 @@ QCameraHeapMemory *QCamera2HardwareInterface::allocateMiscBuf(
     uint8_t bufNum = 0;
     size_t bufSize = 0;
     QCameraHeapMemory *miscBuf = NULL;
-    uint32_t feature_mask =
+    cam_feature_mask_t feature_mask =
             streamInfo->reprocess_config.pp_feature_config.feature_mask;
 
     switch (streamInfo->stream_type) {
@@ -2819,13 +3403,13 @@ QCameraHeapMemory *QCamera2HardwareInterface::allocateMiscBuf(
         miscBuf = new QCameraHeapMemory(QCAMERA_ION_USE_CACHE);
 
         if (!miscBuf) {
-            ALOGE("%s: Unable to allocate miscBuf object", __func__);
+            LOGE("Unable to allocate miscBuf object");
             return NULL;
         }
 
-        rc = miscBuf->allocate(bufNum, bufSize, NON_SECURE);
+        rc = miscBuf->allocate(bufNum, bufSize);
         if (rc < 0) {
-            ALOGE("%s: Failed to allocate misc buffer memory", __func__);
+            LOGE("Failed to allocate misc buffer memory");
             delete miscBuf;
             return NULL;
         }
@@ -2835,55 +3419,49 @@ QCameraHeapMemory *QCamera2HardwareInterface::allocateMiscBuf(
 }
 
 /*===========================================================================
- * FUNCTION   : allocateStreamInfoBuf
+ * FUNCTION   : initStreamInfoBuf
  *
- * DESCRIPTION: alocate stream info buffer
+ * DESCRIPTION: initialize stream info buffer based on stream type
  *
  * PARAMETERS :
  *   @stream_type  : type of stream
+ *   @cam_type      : Camera type in case of dual camera
  *
  * RETURN     : ptr to a memory obj that holds stream info buffer.
  *              NULL if failed
  *==========================================================================*/
-QCameraHeapMemory *QCamera2HardwareInterface::allocateStreamInfoBuf(
-        cam_stream_type_t stream_type)
+int QCamera2HardwareInterface::initStreamInfoBuf(cam_stream_type_t stream_type,
+            cam_stream_info_t *streamInfo, uint32_t cam_type)
 {
     int rc = NO_ERROR;
-    char value[PROPERTY_VALUE_MAX];
-    bool raw_yuv = false;
+    int32_t dt = 0;
+    int32_t vc = 0;
 
-    QCameraHeapMemory *streamInfoBuf = new QCameraHeapMemory(QCAMERA_ION_USE_CACHE);
-    if (!streamInfoBuf) {
-        ALOGE("allocateStreamInfoBuf: Unable to allocate streamInfo object");
-        return NULL;
-    }
-
-    rc = streamInfoBuf->allocate(1, sizeof(cam_stream_info_t), NON_SECURE);
-    if (rc < 0) {
-        ALOGE("allocateStreamInfoBuf: Failed to allocate stream info memory");
-        delete streamInfoBuf;
-        return NULL;
-    }
-
-    cam_stream_info_t *streamInfo = (cam_stream_info_t *)streamInfoBuf->getPtr(0);
     memset(streamInfo, 0, sizeof(cam_stream_info_t));
     streamInfo->stream_type = stream_type;
     rc = mParameters.getStreamFormat(stream_type, streamInfo->fmt);
-    if (isMonoCamera() && stream_type == CAM_STREAM_TYPE_PREVIEW) {
-        // Display does not have support for Y ONLY.
-        // For Mono camera, stream format info for backend will be updated as Y ONLY
-        // Display will be updated as YCbCr, and CbCr data will be
-        // initialized to 128 to get the grey scale image.
-        streamInfo->fmt = CAM_FORMAT_Y_ONLY;
-    }
-    rc = mParameters.getStreamDimension(stream_type, streamInfo->dim);
+    rc = mParameters.getStreamDimension(stream_type, streamInfo->dim, cam_type);
     rc = mParameters.getStreamRotation(stream_type, streamInfo->pp_config, streamInfo->dim);
-    streamInfo->num_bufs = getBufNumRequired(stream_type);
+    streamInfo->num_bufs = getBufNumRequired(stream_type, cam_type);
+    streamInfo->buf_cnt = streamInfo->num_bufs;
     streamInfo->streaming_mode = CAM_STREAMING_MODE_CONTINUOUS;
     streamInfo->is_secure = NON_SECURE;
-    CDBG_HIGH("%s: stream_type %d, stream format %d,stream dimension %dx%d, num_bufs %d\n",
-           __func__, stream_type, streamInfo->fmt, streamInfo->dim.width,
-           streamInfo->dim.height, streamInfo->num_bufs);
+    streamInfo->secure_mode = SECURE_INVALID;
+    streamInfo->bNoBundling = false;
+
+    streamInfo->cam_type = (cam_sync_type_t)cam_type;
+    if (!isNoDisplayMode(cam_type) && (stream_type == CAM_STREAM_TYPE_PREVIEW)) {
+        // Stream sync is needed only in preview display mode
+        streamInfo->bStreamSyncCbNeeded = 1;
+    }
+
+    // Initialize cache ops
+    if (!m_bOptimizeCacheOps) {
+        streamInfo->cache_ops = CAM_STREAM_CACHE_OPS_DISABLED;
+    } else {
+        streamInfo->cache_ops = CAM_STREAM_CACHE_OPS_HONOUR_FLAGS;
+    }
+
     switch (stream_type) {
     case CAM_STREAM_TYPE_SNAPSHOT:
         if ((mParameters.isZSLMode() && mParameters.getRecordingHintValue() != true) ||
@@ -2898,23 +3476,30 @@ QCameraHeapMemory *QCamera2HardwareInterface::allocateStreamInfoBuf(
                         + mParameters.getNumOfExtraBuffersForImageProc());
         }
         break;
-    case CAM_STREAM_TYPE_RAW:
-        property_get("persist.camera.raw_yuv", value, "0");
-        raw_yuv = atoi(value) > 0 ? true : false;
-        if ((mParameters.isZSLMode() || isRdiMode() || raw_yuv) &&
-                !mParameters.getofflineRAW()) {
-            CDBG_HIGH("RDI_DEBUG %s[%d]: CAM_STREAM_TYPE_RAW",
-              __func__, __LINE__);
-            streamInfo->streaming_mode = CAM_STREAMING_MODE_CONTINUOUS;
-        } else {
-            streamInfo->streaming_mode = CAM_STREAMING_MODE_BURST;
-            streamInfo->num_of_burst = mParameters.getNumOfSnapshots();
+    case CAM_STREAM_TYPE_RAW: {
+            char value[PROPERTY_VALUE_MAX];
+            bool raw_yuv = false;
+            property_get("persist.vendor.camera.raw_yuv", value, "0");
+            raw_yuv = atoi(value) > 0 ? true : false;
+            if ((mParameters.isZSLMode()) || (isRdiMode()) || (raw_yuv) || isSecureMode()) {
+                streamInfo->streaming_mode = CAM_STREAMING_MODE_CONTINUOUS;
+            } else {
+                streamInfo->streaming_mode = CAM_STREAMING_MODE_BURST;
+                streamInfo->num_of_burst = mParameters.getNumOfSnapshots();
+            }
+            if (isSecureMode()) {
+                streamInfo->is_secure = SECURE;
+            } else {
+                streamInfo->is_secure = NON_SECURE;
+            }
         }
-        if (mParameters.isSecureMode() && mParameters.isRdiMode()) {
-            streamInfo->is_secure = SECURE;
-        } else {
-            streamInfo->is_secure = NON_SECURE;
+        if (CAM_FORMAT_META_RAW_10BIT == streamInfo->fmt) {
+            mParameters.updateDtVc(&dt, &vc);
+            if (dt)
+                streamInfo->dt = dt;
+            streamInfo->vc = vc;
         }
+
         break;
     case CAM_STREAM_TYPE_POSTVIEW:
         if (mLongshotEnabled) {
@@ -2939,18 +3524,13 @@ QCameraHeapMemory *QCamera2HardwareInterface::allocateStreamInfoBuf(
             mParameters.getHfrFps(pFpsRange);
             streamInfo->user_buf_info.frameInterval =
                     (long)((1000/pFpsRange.video_max_fps) * 1000);
-            CDBG_HIGH("%s: Video Batch Count = %d, interval = %ld", __func__,
+            LOGH("Video Batch Count = %d, interval = %d",
                     streamInfo->user_buf_info.frame_buf_cnt,
                     streamInfo->user_buf_info.frameInterval);
         }
-        break;
-    case CAM_STREAM_TYPE_PREVIEW:
         if (mParameters.getRecordingHintValue()) {
-            const char* dis_param = mParameters.get(QCameraParameters::KEY_QC_DIS);
-            bool disEnabled = (dis_param != NULL)
-                    && !strcmp(dis_param,QCameraParameters::VALUE_ENABLE);
-            if(disEnabled) {
-                streamInfo->is_type = mParameters.getISType();
+            if(mParameters.isDISEnabled()) {
+                streamInfo->is_type = mParameters.getVideoISType();
             } else {
                 streamInfo->is_type = IS_TYPE_NONE;
             }
@@ -2959,8 +3539,33 @@ QCameraHeapMemory *QCamera2HardwareInterface::allocateStreamInfoBuf(
             streamInfo->is_secure = SECURE;
         }
         break;
+    case CAM_STREAM_TYPE_PREVIEW:
+        if (mParameters.getRecordingHintValue()) {
+            if(mParameters.isDISEnabled()) {
+                streamInfo->is_type = mParameters.getPreviewISType();
+            } else {
+                streamInfo->is_type = IS_TYPE_NONE;
+            }
+        }
+        if (isSecureMode()) {
+            streamInfo->is_secure = SECURE;
+            streamInfo->secure_mode = mParameters.getSecureSessionType();
+        } else {
+            streamInfo->is_secure = NON_SECURE;
+        }
+        // If DualCamera, Avoid Preview in snapshot super buf bundling as correction will be
+        // different in preview and snapshot path and so, thumbnail is generated from main image
+        if (isDualCamera() && mParameters.generateThumbFromMain()) {
+            streamInfo->noFrameExpected = 1;
+            LOGH("Avoid Preview stream in snapshot super buf bundle");
+        }
+        break;
     case CAM_STREAM_TYPE_ANALYSIS:
         streamInfo->noFrameExpected = 1;
+        streamInfo->bNoBundling = QCameraCommon::skipAnalysisBundling();
+        break;
+    case CAM_STREAM_TYPE_METADATA:
+        streamInfo->cache_ops = CAM_STREAM_CACHE_OPS_CLEAR_FLAGS;
         break;
     default:
         break;
@@ -2980,7 +3585,7 @@ QCameraHeapMemory *QCamera2HardwareInterface::allocateStreamInfoBuf(
         }
     }
     if (streamInfo->pp_config.feature_mask & CAM_QCOM_FEATURE_SHARPNESS) {
-        streamInfo->pp_config.sharpness = mParameters.getInt(QCameraParameters::KEY_QC_SHARPNESS);
+        streamInfo->pp_config.sharpness = mParameters.getSharpness();
     }
     if (streamInfo->pp_config.feature_mask & CAM_QCOM_FEATURE_EFFECT) {
         streamInfo->pp_config.effect = mParameters.getEffectValue();
@@ -3001,10 +3606,75 @@ QCameraHeapMemory *QCamera2HardwareInterface::allocateStreamInfoBuf(
                 CAM_QCOM_FEATURE_SCALE)
             streamInfo->pp_config.feature_mask |= CAM_QCOM_FEATURE_SCALE;
     }
+    streamInfo->aux_str_info = NULL;
 
-    CDBG_HIGH("%s: allocateStreamInfoBuf: stream type: %d, pp_mask: 0x%x",
-            __func__, stream_type, streamInfo->pp_config.feature_mask);
+    LOGH("type %d, fmt %d, dim %dx%d, num_bufs %d mask = 0x%llx is_type %d\n",
+           stream_type, streamInfo->fmt, streamInfo->dim.width,
+           streamInfo->dim.height, streamInfo->num_bufs,
+           streamInfo->pp_config.feature_mask,
+           streamInfo->is_type);
 
+    return rc;
+}
+
+/*===========================================================================
+ * FUNCTION   : allocateStreamInfoBuf
+ *
+ * DESCRIPTION: alocate stream info buffer
+ *
+ * PARAMETERS :
+ *   @stream_type  : type of stream
+ *   @bufCount       : stream info buffer count
+ *   @cam_type     : Camera type in case of dual camera
+ *
+ * RETURN     : ptr to a memory obj that holds stream info buffer.
+ *              NULL if failed
+ *==========================================================================*/
+QCameraHeapMemory *QCamera2HardwareInterface::allocateStreamInfoBuf(
+        cam_stream_type_t stream_type, uint8_t bufCount, uint32_t cam_type)
+{
+    int rc = NO_ERROR;
+
+    QCameraHeapMemory *streamInfoBuf = new QCameraHeapMemory(QCAMERA_ION_USE_CACHE);
+    if (!streamInfoBuf) {
+        LOGE("allocateStreamInfoBuf: Unable to allocate streamInfo object");
+        return NULL;
+    }
+
+    if (bufCount > MM_CAMERA_MAX_CAM_CNT) {
+        LOGE("buffer count should be lesser than max camera : %d", bufCount);
+        return NULL;
+    }
+    rc = streamInfoBuf->allocate(bufCount, sizeof(cam_stream_info_t));
+    if (rc < 0) {
+        LOGE("allocateStreamInfoBuf: Failed to allocate stream info memory");
+        delete streamInfoBuf;
+        return NULL;
+    }
+
+    for (uint8_t i = 0; i < bufCount; i++) {
+        cam_stream_info_t *streamInfo = (cam_stream_info_t *)streamInfoBuf->getPtr(i);
+        memset(streamInfo, 0, sizeof(cam_stream_info_t));
+        rc = initStreamInfoBuf(stream_type, streamInfo, cam_type);
+        if (rc < 0) {
+            LOGE("initStreamInfoBuf failed");
+            delete streamInfoBuf;
+            return NULL;
+        }
+    }
+
+    cam_stream_info_t *streamInfo = (cam_stream_info_t *)streamInfoBuf->getPtr(0);
+    if (bufCount == MM_CAMERA_MAX_CAM_CNT) {
+        cam_stream_info_t *s_streamInfo = (cam_stream_info_t *)streamInfoBuf->getPtr(1);
+        streamInfo->aux_str_info = s_streamInfo;
+    }
+
+    if (streamInfo->aux_str_info != NULL) {
+        /*Update StreamInfo for Aux camera*/
+        streamInfo->aux_str_info->buf_cnt = getBufNumForAux(stream_type);
+        streamInfo->num_bufs += streamInfo->aux_str_info->buf_cnt;
+        streamInfo->aux_str_info->num_bufs += streamInfo->aux_str_info->buf_cnt;
+    }
     return streamInfoBuf;
 }
 
@@ -3028,7 +3698,7 @@ QCameraMemory *QCamera2HardwareInterface::allocateStreamUserBuf(
     int size = 0;
 
     if (streamInfo->streaming_mode != CAM_STREAMING_MODE_BATCH) {
-        ALOGE("%s: Stream is not in BATCH mode. Invalid Stream", __func__);
+        LOGE("Stream is not in BATCH mode. Invalid Stream");
         return NULL;
     }
 
@@ -3036,8 +3706,31 @@ QCameraMemory *QCamera2HardwareInterface::allocateStreamUserBuf(
     switch (streamInfo->stream_type) {
     case CAM_STREAM_TYPE_VIDEO: {
         QCameraVideoMemory *video_mem = new QCameraVideoMemory(
-                mGetMemory, mCallbackCookie, FALSE, CAM_STREAM_BUF_TYPE_USERPTR);
-        video_mem->allocateMeta(streamInfo->num_bufs);
+                mGetMemory, mCallbackCookie, FALSE, QCAMERA_MEM_TYPE_BATCH);
+        if (video_mem == NULL) {
+            LOGE("Out of memory for video obj");
+            return NULL;
+        }
+
+        int usage = 0;
+        cam_format_t fmt;
+        mParameters.getStreamFormat(CAM_STREAM_TYPE_VIDEO, fmt);
+        if(mParameters.isUBWCEnabled() && (fmt == CAM_FORMAT_YUV_420_NV12_UBWC)) {
+            usage = private_handle_t::PRIV_FLAGS_UBWC_ALIGNED;
+        }
+        video_mem->setVideoInfo(usage, fmt);
+
+        /*
+        *   numFDs = BATCH size
+        *  numInts = 5  // OFFSET, SIZE, USAGE, TIMESTAMP, FORMAT
+        */
+        rc = video_mem->allocateMeta(streamInfo->num_bufs,
+                mParameters.getBufBatchCount());
+        if (rc < 0) {
+            LOGE("allocateMeta failed");
+            delete video_mem;
+            return NULL;
+        }
         mem = static_cast<QCameraMemory *>(video_mem);
     }
     break;
@@ -3050,7 +3743,7 @@ QCameraMemory *QCamera2HardwareInterface::allocateStreamUserBuf(
     case CAM_STREAM_TYPE_METADATA:
     case CAM_STREAM_TYPE_OFFLINE_PROC:
     case CAM_STREAM_TYPE_CALLBACK:
-        ALOGE("%s: Stream type Not supported.for BATCH processing", __func__);
+        LOGE("Stream type Not supported.for BATCH processing");
     break;
 
     case CAM_STREAM_TYPE_DEFAULT:
@@ -3059,7 +3752,7 @@ QCameraMemory *QCamera2HardwareInterface::allocateStreamUserBuf(
         break;
     }
     if (!mem) {
-        ALOGE("%s: Failed to allocate mem", __func__);
+        LOGE("Failed to allocate mem");
         return NULL;
     }
 
@@ -3067,11 +3760,11 @@ QCameraMemory *QCamera2HardwareInterface::allocateStreamUserBuf(
     size = PAD_TO_SIZE((streamInfo->num_bufs * streamInfo->user_buf_info.size),
             CAM_PAD_TO_4K);
 
-    CDBG_HIGH("%s: Allocating BATCH Buffer count = %d", __func__, streamInfo->num_bufs);
+    LOGH("Allocating BATCH Buffer count = %d", streamInfo->num_bufs);
 
     if (size > 0) {
         // Allocating one buffer for all batch buffers
-        rc = mem->allocate(1, size, NON_SECURE);
+        rc = mem->allocate(1, size);
         if (rc < 0) {
             delete mem;
             return NULL;
@@ -3166,7 +3859,7 @@ int QCamera2HardwareInterface::setCallBacks(camera_notify_callback notify_cb,
 void QCamera2HardwareInterface::setJpegCallBacks(jpeg_data_callback jpegCb,
                                             void *callbackCookie)
 {
-    CDBG_HIGH("%s: camera id %d", __func__, getCameraId());
+    LOGH("camera id %d", getCameraId());
     mJpegCb        = jpegCb;
     mJpegCallbackCookie  = callbackCookie;
     m_cbNotifier.setJpegCallBacks(mJpegCb, mJpegCallbackCookie);
@@ -3193,17 +3886,25 @@ int QCamera2HardwareInterface::enableMsgType(int32_t msg_type)
               Preview callback  in UBWC case*/
         if (!(msgTypeEnabled(CAMERA_MSG_PREVIEW_FRAME)) &&
                 (msg_type & CAMERA_MSG_PREVIEW_FRAME)) {
-            if (m_channels[QCAMERA_CH_TYPE_CALLBACK] != NULL) {
+            // Start callback channel only when preview/zsl channel is active
+            QCameraChannel* previewCh = NULL;
+            if (isZSLMode() && (getRecordingHintValue() != true)) {
+                previewCh = m_channels[QCAMERA_CH_TYPE_ZSL];
+            } else {
+                previewCh = m_channels[QCAMERA_CH_TYPE_PREVIEW];
+            }
+            QCameraChannel* callbackCh = m_channels[QCAMERA_CH_TYPE_CALLBACK];
+            if ((callbackCh != NULL) &&
+                    (previewCh != NULL) && previewCh->isActive()) {
                 rc = startChannel(QCAMERA_CH_TYPE_CALLBACK);
                 if (rc != NO_ERROR) {
-                    ALOGE("%s : START Callback Channel failed", __func__);
+                    LOGE("START Callback Channel failed");
                 }
             }
         }
     }
-
     mMsgEnabled |= msg_type;
-    CDBG_HIGH("%s (0x%x) : mMsgEnabled = 0x%x", __func__, msg_type , mMsgEnabled );
+    LOGH("(0x%x) : mMsgEnabled = 0x%x rc = %d", msg_type , mMsgEnabled, rc);
     return rc;
 }
 
@@ -3227,17 +3928,18 @@ int QCamera2HardwareInterface::disableMsgType(int32_t msg_type)
         /*STOP CALLBACK STREAM*/
         if ((msgTypeEnabled(CAMERA_MSG_PREVIEW_FRAME)) &&
                 (msg_type & CAMERA_MSG_PREVIEW_FRAME)) {
-            if (m_channels[QCAMERA_CH_TYPE_CALLBACK] != NULL) {
+            // Stop callback channel only if it is active
+            if ((m_channels[QCAMERA_CH_TYPE_CALLBACK] != NULL) &&
+                   (m_channels[QCAMERA_CH_TYPE_CALLBACK]->isActive())) {
                 rc = stopChannel(QCAMERA_CH_TYPE_CALLBACK);
                 if (rc != NO_ERROR) {
-                    ALOGE("%s : STOP Callback Channel failed", __func__);
+                    LOGE("STOP Callback Channel failed");
                 }
             }
         }
     }
-
     mMsgEnabled &= ~msg_type;
-    CDBG_HIGH("%s (0x%x) : mMsgEnabled = 0x%x", __func__, msg_type , mMsgEnabled );
+    LOGH("(0x%x) : mMsgEnabled = 0x%x rc = %d", msg_type , mMsgEnabled, rc);
     return rc;
 }
 
@@ -3290,51 +3992,93 @@ int QCamera2HardwareInterface::msgTypeEnabledWithLock(int32_t msg_type)
  *==========================================================================*/
 int QCamera2HardwareInterface::startPreview()
 {
-    KPI_ATRACE_CALL();
+    KPI_ATRACE_CAMSCOPE_CALL(CAMSCOPE_HAL1_STARTPREVIEW);
     int32_t rc = NO_ERROR;
-    CDBG_HIGH("%s: E", __func__);
+
+    LOGI("E ZSL = %d Recording Hint = %d", mParameters.isZSLMode(),
+            mParameters.getRecordingHintValue());
+
+    m_perfLockMgr.acquirePerfLockIfExpired(PERF_LOCK_START_PREVIEW);
+
+#ifdef USE_DISPLAY_SERVICE
+    if(!mCameraDisplay->startVsync(TRUE)) {
+        LOGE("Error: Cannot start vsync (still continue)");
+    }
+#endif //USE_DISPLAY_SERVICE
+
     updateThermalLevel((void *)&mThermalLevel);
+
+    setDisplayFrameSkip();
+
     // start preview stream
     if (mParameters.isZSLMode() && mParameters.getRecordingHintValue() != true) {
         rc = startChannel(QCAMERA_CH_TYPE_ZSL);
+    } else if (isSecureMode()) {
+        if (mParameters.getSecureStreamType() == CAM_STREAM_TYPE_RAW && !isRdiMode()) {
+            rc = startChannel(QCAMERA_CH_TYPE_RAW);
+        }else {
+            rc = startChannel(QCAMERA_CH_TYPE_PREVIEW);
+        }
     } else {
         rc = startChannel(QCAMERA_CH_TYPE_PREVIEW);
     }
 
-    if (rc == NO_ERROR && (msgTypeEnabled(CAMERA_MSG_PREVIEW_FRAME))
+    if (isDualCamera()) {
+        if (rc == NO_ERROR) {
+            mParameters.setDCDeferCamera(CAM_DEFER_PROCESS);
+            mParameters.setDCLowPowerMode(mActiveCameras);
+        } else {
+            mParameters.setDCDeferCamera(CAM_DEFER_FLUSH);
+        }
+    }
+
+    if (rc != NO_ERROR) {
+        LOGE("failed to start channels");
+        m_perfLockMgr.releasePerfLock(PERF_LOCK_START_PREVIEW);
+        return rc;
+    }
+
+    if ((msgTypeEnabled(CAMERA_MSG_PREVIEW_FRAME))
             && (m_channels[QCAMERA_CH_TYPE_CALLBACK] != NULL)) {
         rc = startChannel(QCAMERA_CH_TYPE_CALLBACK);
         if (rc != NO_ERROR) {
-            ALOGE("%s: failed to start callback stream", __func__);
+            LOGE("failed to start callback stream");
             stopChannel(QCAMERA_CH_TYPE_ZSL);
             stopChannel(QCAMERA_CH_TYPE_PREVIEW);
+            m_perfLockMgr.releasePerfLock(PERF_LOCK_START_PREVIEW);
+            return rc;
         }
     }
 
     updatePostPreviewParameters();
+    m_stateMachine.setPreviewCallbackNeeded(true);
 
     // if job id is non-zero, that means the postproc init job is already
     // pending or complete
-    if (mInitPProcJob == 0) {
+    if (mInitPProcJob == 0
+            && !(isSecureMode() && isRdiMode())) {
         mInitPProcJob = deferPPInit();
         if (mInitPProcJob == 0) {
-            ALOGE("%s: Unable to initialize postprocessor, mCameraHandle = %p",
-                    __func__, mCameraHandle);
-            rc = UNKNOWN_ERROR;
+            LOGE("Unable to initialize postprocessor, mCameraHandle = %p",
+                     mCameraHandle);
+            rc = -ENOMEM;
+            m_perfLockMgr.releasePerfLock(PERF_LOCK_START_PREVIEW);
+            return rc;
         }
     }
+    m_bPreviewStarted = true;
 
-    mParameters.setPreviewCallbackNeeded(true);
-    CDBG_HIGH("%s: X", __func__);
+    //configure snapshot skip for dual camera usecases
+    configureSnapshotSkip(true);
+
+    LOGI("X rc = %d", rc);
     return rc;
 }
 
 int32_t QCamera2HardwareInterface::updatePostPreviewParameters() {
     // Enable OIS only in Camera mode and 4k2k camcoder mode
     int32_t rc = NO_ERROR;
-    pthread_mutex_lock(&m_parm_lock);
-    rc = mParameters.updateOisValue(1);
-    pthread_mutex_unlock(&m_parm_lock);
+    rc = mParameters.updateOisMode(OIS_MODE_ACTIVE);
     return NO_ERROR;
 }
 
@@ -3351,23 +4095,44 @@ int32_t QCamera2HardwareInterface::updatePostPreviewParameters() {
  *==========================================================================*/
 int QCamera2HardwareInterface::stopPreview()
 {
-    KPI_ATRACE_CALL();
-    CDBG_HIGH("%s: E", __func__);
+    KPI_ATRACE_CAMSCOPE_CALL(CAMSCOPE_HAL1_STOPPREVIEW);
+    LOGI("E");
     mNumPreviewFaces = -1;
     mActiveAF = false;
+
+    if (mLiveSnapshotThread != 0) {
+        pthread_join(mLiveSnapshotThread,NULL);
+        mLiveSnapshotThread = 0;
+    }
+    // Wake up both sensors before stopping preview
+    if (isDualCamera()) {
+        mParameters.setDCLowPowerMode(MM_CAMERA_DUAL_CAM);
+    }
+
+    m_perfLockMgr.releasePerfLock(PERF_LOCK_POWERHINT_PREVIEW);
+    m_perfLockMgr.acquirePerfLockIfExpired(PERF_LOCK_STOP_PREVIEW);
+
     // stop preview stream
     stopChannel(QCAMERA_CH_TYPE_CALLBACK);
     stopChannel(QCAMERA_CH_TYPE_ZSL);
     stopChannel(QCAMERA_CH_TYPE_PREVIEW);
+    stopChannel(QCAMERA_CH_TYPE_RAW);
 
     m_cbNotifier.flushPreviewNotifications();
     //add for ts makeup
 #ifdef TARGET_TS_MAKEUP
     ts_makeup_finish();
 #endif
+
     // delete all channels from preparePreview
     unpreparePreview();
-    CDBG_HIGH("%s: X", __func__);
+    m_bFirstPreviewFrameReceived = false;
+#ifdef USE_DISPLAY_SERVICE
+    mCameraDisplay->startVsync(FALSE);
+#endif //Use_DISPLAY_SERVICE
+
+    m_perfLockMgr.releasePerfLock(PERF_LOCK_STOP_PREVIEW);
+    LOGI("X");
     return NO_ERROR;
 }
 
@@ -3403,19 +4168,17 @@ int QCamera2HardwareInterface::storeMetaDataInBuffers(int enable)
 int QCamera2HardwareInterface::preStartRecording()
 {
     int32_t rc = NO_ERROR;
-    CDBG_HIGH("%s: E", __func__);
+    LOGH("E");
     if (mParameters.getRecordingHintValue() == false) {
 
         // Give HWI control to restart preview only in single camera mode.
         // In dual-cam mode, this control belongs to muxer.
         if (getRelatedCamSyncInfo()->sync_control != CAM_SYNC_RELATED_SENSORS_ON) {
-            CDBG_HIGH("%s: start recording when hint is false, stop preview first", __func__);
+            LOGH("start recording when hint is false, stop preview first");
             stopPreview();
 
             // Set recording hint to TRUE
-            pthread_mutex_lock(&m_parm_lock);
             mParameters.updateRecordingHintValue(TRUE);
-            pthread_mutex_unlock(&m_parm_lock);
             rc = preparePreview();
             if (rc == NO_ERROR) {
                 rc = startPreview();
@@ -3429,7 +4192,7 @@ int QCamera2HardwareInterface::preStartRecording()
         }
     }
 
-    CDBG_HIGH("%s: X", __func__);
+    LOGH("X rc = %d", rc);
     return rc;
 }
 
@@ -3447,7 +4210,10 @@ int QCamera2HardwareInterface::preStartRecording()
 int QCamera2HardwareInterface::startRecording()
 {
     int32_t rc = NO_ERROR;
-    CDBG_HIGH("%s: E", __func__);
+    bool bCachedMem = QCAMERA_ION_USE_CACHE;
+    LOGI("E");
+
+    m_perfLockMgr.acquirePerfLockIfExpired(PERF_LOCK_START_RECORDING);
 
     //link meta stream with video channel if low power mode.
     if (isLowPowerMode()) {
@@ -3473,25 +4239,103 @@ int QCamera2HardwareInterface::startRecording()
         if ((NULL != pMetaChannel) && (NULL != pMetaStream)) {
             rc = pVideoChannel->linkStream(pMetaChannel, pMetaStream);
             if (NO_ERROR != rc) {
-                CDBG_HIGH("%s : Metadata stream link failed %d", __func__, rc);
+                LOGW("Metadata stream link failed %d", rc);
             }
         }
     }
 
-    if (rc == NO_ERROR) {
+    if (rc == NO_ERROR && !(mParameters.isVideoFaceBeautification()) ) {
         rc = startChannel(QCAMERA_CH_TYPE_VIDEO);
-    }
-
-#ifdef HAS_MULTIMEDIA_HINTS
-    if (rc == NO_ERROR) {
-        if (m_pPowerModule) {
-            if (m_pPowerModule->powerHint) {
-                m_pPowerModule->powerHint(m_pPowerModule, POWER_HINT_VIDEO_ENCODE, (void *)"state=1");
+    } else {
+        m_bNeedVideoCb = true;
+        QCameraChannel *pChannelreq = NULL;
+        QCameraStream *pStreamreq = NULL;
+        if (m_channels[QCAMERA_CH_TYPE_PREVIEW] != NULL) {
+            pChannelreq = m_channels[QCAMERA_CH_TYPE_PREVIEW];
+            uint32_t streamNum = pChannelreq->getNumOfStreams();
+            QCameraStream *pStream = NULL;
+            for (uint32_t i = 0 ; i < streamNum ; i++ ) {
+                pStream = pChannelreq->getStreamByIndex(i);
+                if ((NULL != pStream) &&
+                        (CAM_STREAM_TYPE_PREVIEW == pStream->getMyType())) {
+                    pStreamreq = pStream;
+                    break;
+                }
             }
         }
+        if(pStreamreq == NULL)
+        {
+            LOGE("Error:Stream not found! ret %d",INVALID_OPERATION);
+            return INVALID_OPERATION;
+        }
+        QCameraMemory *previewmem = pStreamreq->getStreamBufs();
+        //Use uncached allocation by default
+        if (mParameters.isVideoBuffersCached() || mParameters.isSeeMoreEnabled() ||
+                mParameters.isHighQualityNoiseReductionMode()) {
+            bCachedMem = QCAMERA_ION_USE_CACHE;
+        } else {
+            bCachedMem = QCAMERA_ION_USE_NOCACHE;
+        }
+
+        videoMemFb = NULL;
+        int usage = 0;
+        cam_format_t fmt;
+        videoMemFb =
+                    new QCameraVideoMemory(mGetMemory, mCallbackCookie, bCachedMem);
+        if (videoMemFb == NULL) {
+            LOGE("Out of memory for video obj");
+            return NULL;
+        }
+        mParameters.getStreamFormat(CAM_STREAM_TYPE_VIDEO,fmt);
+        if (mParameters.isUBWCEnabled() &&
+             (fmt == CAM_FORMAT_YUV_420_NV12_UBWC)) {
+             usage = private_handle_t::PRIV_FLAGS_UBWC_ALIGNED;
+        }
+        videoMemFb->setVideoInfo(usage, fmt);
+        videoMemFb->allocateMetaBufs(VIDEO_FB_BUF_COUNT,previewmem);
     }
-#endif
-    CDBG_HIGH("%s: X", __func__);
+
+    if (mParameters.isTNRSnapshotEnabled() && !isLowPowerMode()) {
+        QCameraChannel *pChannel = m_channels[QCAMERA_CH_TYPE_SNAPSHOT];
+        if (!mParameters.is4k2kVideoResolution()) {
+            // Find and try to link a metadata stream from preview channel
+            QCameraChannel *pMetaChannel = NULL;
+            QCameraStream *pMetaStream = NULL;
+
+            if (m_channels[QCAMERA_CH_TYPE_PREVIEW] != NULL) {
+                pMetaChannel = m_channels[QCAMERA_CH_TYPE_PREVIEW];
+                uint32_t streamNum = pMetaChannel->getNumOfStreams();
+                QCameraStream *pStream = NULL;
+                for (uint32_t i = 0 ; i < streamNum ; i++ ) {
+                    pStream = pMetaChannel->getStreamByIndex(i);
+                    if ((NULL != pStream) &&
+                            (CAM_STREAM_TYPE_METADATA ==
+                            pStream->getMyType())) {
+                        pMetaStream = pStream;
+                        break;
+                    }
+                }
+            }
+
+            if ((NULL != pMetaChannel) && (NULL != pMetaStream)) {
+                rc = pChannel->linkStream(pMetaChannel, pMetaStream);
+                if (NO_ERROR != rc) {
+                    LOGW("Metadata stream link failed %d", rc);
+                }
+            }
+        }
+        LOGH("START snapshot Channel for TNR processing");
+        rc = pChannel->start();
+    }
+
+    m_perfLockMgr.releasePerfLock(PERF_LOCK_START_RECORDING);
+
+    if (rc == NO_ERROR) {
+        // Set power Hint for video encoding
+        m_perfLockMgr.acquirePerfLock(PERF_LOCK_POWERHINT_ENCODE, 0);
+    }
+
+    LOGI("X rc = %d", rc);
     return rc;
 }
 
@@ -3508,21 +4352,28 @@ int QCamera2HardwareInterface::startRecording()
  *==========================================================================*/
 int QCamera2HardwareInterface::stopRecording()
 {
-    CDBG_HIGH("%s: E", __func__);
+    LOGI("E");
+
+    // Disable power hint for video encoding
+    m_perfLockMgr.releasePerfLock(PERF_LOCK_POWERHINT_ENCODE);
+
+    m_perfLockMgr.acquirePerfLockIfExpired(PERF_LOCK_STOP_RECORDING);
+
+    // stop snapshot channel
+    if (mParameters.isTNRSnapshotEnabled()) {
+        LOGH("STOP snapshot Channel for TNR processing");
+        stopChannel(QCAMERA_CH_TYPE_SNAPSHOT);
+    }
     int rc = stopChannel(QCAMERA_CH_TYPE_VIDEO);
 
-#ifdef USE_MEDIA_EXTENSIONS
     m_cbNotifier.flushVideoNotifications();
-#endif
 
-#ifdef HAS_MULTIMEDIA_HINTS
-    if (m_pPowerModule) {
-        if (m_pPowerModule->powerHint) {
-            m_pPowerModule->powerHint(m_pPowerModule, POWER_HINT_VIDEO_ENCODE, (void *)"state=0");
-        }
+    m_perfLockMgr.releasePerfLock(PERF_LOCK_STOP_RECORDING);
+    if (mParameters.isVideoFaceBeautification()) {
+        m_bNeedVideoCb = false;
     }
-#endif
-    CDBG_HIGH("%s: X", __func__);
+
+    LOGI("X rc = %d", rc);
     return rc;
 }
 
@@ -3542,10 +4393,15 @@ int QCamera2HardwareInterface::releaseRecordingFrame(const void * opaque)
 {
     int32_t rc = UNKNOWN_ERROR;
     QCameraVideoChannel *pChannel =
-        (QCameraVideoChannel *)m_channels[QCAMERA_CH_TYPE_VIDEO];
-    CDBG("%s: opaque data = %p", __func__,opaque);
-    if(pChannel != NULL) {
+            (QCameraVideoChannel *)m_channels[QCAMERA_CH_TYPE_VIDEO];
+    QCameraChannel *pChannelfb =
+            m_channels[QCAMERA_CH_TYPE_PREVIEW];
+    LOGD("opaque data = %p",opaque);
+
+    if(pChannel != NULL && !(m_bNeedVideoCb)) {
         rc = pChannel->releaseFrame(opaque, mStoreMetaDataInFrame > 0);
+    } else if (pChannelfb != NULL && (m_bNeedVideoCb)) {
+        rc = pChannelfb->releaseFrame(opaque, mStoreMetaDataInFrame > 0, videoMemFb);
     }
     return rc;
 }
@@ -3565,8 +4421,7 @@ int QCamera2HardwareInterface::autoFocus()
 {
     int rc = NO_ERROR;
     cam_focus_mode_type focusMode = mParameters.getFocusMode();
-    CDBG_HIGH("[AF_DBG] %s: focusMode=%d, m_currentFocusState=%d",
-            __func__, focusMode, m_currentFocusState);
+    LOGH("E");
 
     switch (focusMode) {
     case CAM_FOCUS_MODE_AUTO:
@@ -3574,13 +4429,26 @@ int QCamera2HardwareInterface::autoFocus()
     case CAM_FOCUS_MODE_CONTINOUS_VIDEO:
     case CAM_FOCUS_MODE_CONTINOUS_PICTURE:
         mActiveAF = true;
+        if (isDualCamera() && mBundledSnapshot) {
+            // Force the cameras to stream for auto focus on both
+            forceCameraWakeup();
+        }
+        //Send dummy focus event if the active camera doesn't support AF.
+        if (isDualCamera() && !mParameters.isAutoFocusSupported(mActiveCameras)) {
+            mActiveAF = false;
+            rc = sendEvtNotify(CAMERA_MSG_FOCUS, true, 0);
+            break;
+        }
+        LOGI("Send AUTO FOCUS event. focusMode=%d, m_currentFocusState=%d \
+                mActiveCameras %d, mMasterCamera %d",
+                focusMode, m_currentFocusState, mActiveCameras, mMasterCamera);
         rc = mCameraHandle->ops->do_auto_focus(mCameraHandle->camera_handle);
         break;
     case CAM_FOCUS_MODE_INFINITY:
     case CAM_FOCUS_MODE_FIXED:
     case CAM_FOCUS_MODE_EDOF:
     default:
-        ALOGE("%s: No ops in focusMode (%d)", __func__, focusMode);
+        LOGI("No ops in focusMode (%d)", focusMode);
         rc = sendEvtNotify(CAMERA_MSG_FOCUS, true, 0);
         break;
     }
@@ -3588,6 +4456,7 @@ int QCamera2HardwareInterface::autoFocus()
     if (NO_ERROR != rc) {
         mActiveAF = false;
     }
+    LOGH("X rc = %d", rc);
     return rc;
 }
 
@@ -3619,7 +4488,7 @@ int QCamera2HardwareInterface::cancelAutoFocus()
     case CAM_FOCUS_MODE_FIXED:
     case CAM_FOCUS_MODE_EDOF:
     default:
-        CDBG("%s: No ops in focusMode (%d)", __func__, focusMode);
+        LOGD("No ops in focusMode (%d)", focusMode);
         break;
     }
     return rc;
@@ -3652,19 +4521,22 @@ bool QCamera2HardwareInterface::processUFDumps(qcamera_jpeg_evt_payload_t *evt)
        omx_jpeg_ouput_buf_t *jpeg_out = NULL;
        size_t dataLen;
        uint8_t *dataPtr;
-       waitDeferredWork(mInitPProcJob);
+       if (NO_ERROR != waitDeferredWork(mInitPProcJob)) {
+           LOGE("Init PProc Deferred work failed");
+           return false;
+       }
        if (!m_postprocessor.getJpegMemOpt()) {
            dataLen = evt->out_data.buf_filled_len;
            dataPtr = evt->out_data.buf_vaddr;
        } else {
            jpeg_out  = (omx_jpeg_ouput_buf_t*) evt->out_data.buf_vaddr;
            if (!jpeg_out) {
-              ALOGE("%s:%d] Null pointer detected",  __func__, __LINE__);
+              LOGE("Null pointer detected");
               return false;
            }
            jpeg_mem = (camera_memory_t *)jpeg_out->mem_hdl;
            if (!jpeg_mem) {
-              ALOGE("%s:%d] Null pointer detected",  __func__, __LINE__);
+              LOGE("Null pointer detected");
               return false;
            }
            dataPtr = (uint8_t *)jpeg_mem->data;
@@ -3679,7 +4551,7 @@ bool QCamera2HardwareInterface::processUFDumps(qcamera_jpeg_evt_payload_t *evt)
        }
        CAM_DUMP_TO_FILE(QCAMERA_DUMP_FRM_LOCATION"ubifocus", name, index, "jpg",
            dataPtr, dataLen);
-       CDBG("%s:%d] Dump the image %d %d allFocusImage %d", __func__, __LINE__,
+       LOGD("Dump the image %d %d allFocusImage %d",
            getOutputImageCount(), index, allFocusImage);
        setOutputImageCount(getOutputImageCount() + 1);
        if (!allFocusImage) {
@@ -3704,27 +4576,36 @@ int32_t QCamera2HardwareInterface::unconfigureAdvancedCapture()
 {
     int32_t rc = NO_ERROR;
 
+    /*Disable Quadra CFA & RAW Capture mode*/
+    LOGH("Disabling Quadra CFA & RAW ZSL Capture mode ");
+    mParameters.setQuadraCfaMode(false, true);
+    mParameters.setRawCaptureMode(false);
+
     if (mAdvancedCaptureConfigured) {
 
         mAdvancedCaptureConfigured = false;
 
         if(mIs3ALocked) {
-            mParameters.set3ALock(QCameraParameters::VALUE_FALSE);
+            mParameters.set3ALock(false);
             mIs3ALocked = false;
         }
         if (mParameters.isHDREnabled() || mParameters.isAEBracketEnabled()) {
             rc = mParameters.setToneMapMode(true, true);
             if (rc != NO_ERROR) {
-                CDBG_HIGH("%s: Failed to enable tone map during HDR/AEBracketing", __func__);
+                LOGW("Failed to enable tone map during HDR/AEBracketing");
             }
             mHDRBracketingEnabled = false;
             rc = mParameters.stopAEBracket();
-        } else if (mParameters.isChromaFlashEnabled() || mFlashNeeded) {
-            rc = mParameters.resetFrameCapture(TRUE);
+        } else if ((mParameters.isChromaFlashEnabled())
+                || (mFlashConfigured && !mLongshotEnabled)
+                || (mLowLightConfigured == true)
+                || (mParameters.getManualCaptureMode() >= CAM_MANUAL_CAPTURE_TYPE_2)) {
+            rc = mParameters.resetFrameCapture(TRUE, mLowLightConfigured);
         } else if (mParameters.isUbiFocusEnabled() || mParameters.isUbiRefocus()) {
             rc = configureAFBracketing(false);
         } else if (mParameters.isOptiZoomEnabled()) {
             rc = mParameters.setAndCommitZoom(mZoomLevel);
+            setDisplaySkip(FALSE, CAMERA_MAX_PARAM_APPLY_DELAY);
         } else if (mParameters.isStillMoreEnabled()) {
             cam_still_more_t stillmore_config = mParameters.getStillMoreSettings();
             stillmore_config.burst_count = 0;
@@ -3734,17 +4615,19 @@ int32_t QCamera2HardwareInterface::unconfigureAdvancedCapture()
             if (!mParameters.isSeeMoreEnabled() && !mParameters.isLTMForSeeMoreEnabled()) {
                 rc = mParameters.setToneMapMode(true, true);
                 if (rc != NO_ERROR) {
-                    CDBG_HIGH("%s: Failed to enable tone map during StillMore", __func__);
+                    LOGW("Failed to enable tone map during StillMore");
                 }
             }
 
             /* Re-enable Tintless */
             mParameters.setTintless(true);
         } else {
-            ALOGE("%s: No Advanced Capture feature enabled!! ", __func__);
+            LOGW("No Advanced Capture feature enabled!!");
             rc = BAD_VALUE;
         }
     }
+
+    configureSnapshotSkip(true);
 
     return rc;
 }
@@ -3762,32 +4645,36 @@ int32_t QCamera2HardwareInterface::unconfigureAdvancedCapture()
  *==========================================================================*/
 int32_t QCamera2HardwareInterface::configureAdvancedCapture()
 {
-    CDBG_HIGH("%s: E",__func__);
+    LOGH("E");
     int32_t rc = NO_ERROR;
 
     rc = mParameters.checkFeatureConcurrency();
     if (rc != NO_ERROR) {
-        ALOGE("%s: Cannot support Advanced capture modes", __func__);
+        LOGE("Cannot support Advanced capture modes");
         return rc;
     }
+    /*Enable Quadra CFA mode*/
+    mParameters.setQuadraCfaMode(true, true);
+    /*Enable RAW Capture mode*/
+    mParameters.setRawCaptureMode(true);
 
     setOutputImageCount(0);
     mInputCount = 0;
+    mAdvancedCaptureConfigured = true;
+    /* Display should be disabled for advanced modes */
+    bool bSkipDisplay = true;
 
     if (getRelatedCamSyncInfo()->mode == CAM_MODE_SECONDARY) {
         // no Advance capture settings for Aux camera
-        CDBG_HIGH("%s: X Secondary Camera, no need to process!! ", __func__);
+        LOGH("X Secondary Camera, no need to process!! ");
         return rc;
     }
 
-    pthread_mutex_lock(&m_parm_lock);
-
-    /* Temporarily stop display only if not in stillmore livesnapshot */
-    if (!(mParameters.isStillMoreEnabled() &&
-            mParameters.isSeeMoreEnabled())) {
-        mParameters.setDisplayFrame(FALSE);
+    /* Do not stop display if in stillmore livesnapshot */
+    if (mParameters.isStillMoreEnabled() &&
+            mParameters.isSeeMoreEnabled()) {
+        bSkipDisplay = false;
     }
-
     if (mParameters.isUbiFocusEnabled() || mParameters.isUbiRefocus()) {
         rc = configureAFBracketing();
     } else if (mParameters.isOptiZoomEnabled()) {
@@ -3797,32 +4684,46 @@ int32_t QCamera2HardwareInterface::configureAdvancedCapture()
         if (mHDRBracketingEnabled) {
             rc = mParameters.setToneMapMode(false, true);
             if (rc != NO_ERROR) {
-                CDBG_HIGH("%s: Failed to disable tone map during HDR", __func__);
+                LOGW("Failed to disable tone map during HDR");
             }
         }
     } else if (mParameters.isAEBracketEnabled()) {
         rc = mParameters.setToneMapMode(false, true);
         if (rc != NO_ERROR) {
-            CDBG_HIGH("%s: Failed to disable tone map during AEBracketing", __func__);
+            LOGW("Failed to disable tone map during AEBracketing");
         }
         rc = configureAEBracketing();
     } else if (mParameters.isStillMoreEnabled()) {
+        bSkipDisplay = false;
         rc = configureStillMore();
-    } else if (mParameters.isChromaFlashEnabled() || mFlashNeeded) {
+    } else if ((mParameters.isChromaFlashEnabled())
+            || (mParameters.getLowLightLevel() != CAM_LOW_LIGHT_OFF)
+            || (mParameters.getManualCaptureMode() >= CAM_MANUAL_CAPTURE_TYPE_2)) {
         rc = mParameters.configFrameCapture(TRUE);
+        if (mParameters.getLowLightLevel() != CAM_LOW_LIGHT_OFF) {
+            mLowLightConfigured = true;
+        }
+    } else if (mFlashNeeded && !mLongshotEnabled) {
+        rc = mParameters.configFrameCapture(TRUE);
+        mFlashConfigured = true;
+        bSkipDisplay = false;
     } else {
-        ALOGE("%s: No Advanced Capture feature enabled!! ", __func__);
-        rc = BAD_VALUE;
-    }
-
-    if (NO_ERROR == rc) {
-        mAdvancedCaptureConfigured = true;
-    } else {
+        LOGH("Advanced Capture feature not enabled!! ");
         mAdvancedCaptureConfigured = false;
+        bSkipDisplay = false;
     }
 
-    pthread_mutex_unlock(&m_parm_lock);
-    CDBG_HIGH("%s: X",__func__);
+    if (m_postprocessor.isHalPPEnabled()) {
+        LOGH("HALPP is enabled, check if halpp is needed for current snapshot.");
+        configureHalPostProcess();
+    }
+
+    LOGH("Stop preview temporarily for advanced captures");
+    setDisplaySkip(bSkipDisplay);
+
+    configureSnapshotSkip(false);
+
+    LOGH("X rc = %d", rc);
     return rc;
 }
 
@@ -3839,7 +4740,7 @@ int32_t QCamera2HardwareInterface::configureAdvancedCapture()
  *==========================================================================*/
 int32_t QCamera2HardwareInterface::configureAFBracketing(bool enable)
 {
-    CDBG_HIGH("%s: E",__func__);
+    LOGH("E");
     int32_t rc = NO_ERROR;
     cam_af_bracketing_t *af_bracketing_need;
 
@@ -3859,19 +4760,19 @@ int32_t QCamera2HardwareInterface::configureAFBracketing(bool enable)
 
     for(int8_t i = 0; i < MAX_AF_BRACKETING_VALUES; i++) {
         afBracket.focus_steps[i] = af_bracketing_need->focus_steps[i];
-        CDBG_HIGH("%s: focus_step[%d] = %d", __func__, i, afBracket.focus_steps[i]);
+        LOGH("focus_step[%d] = %d", i, afBracket.focus_steps[i]);
     }
     //Send cmd to backend to set AF Bracketing for Ubi Focus.
     rc = mParameters.commitAFBracket(afBracket);
     if ( NO_ERROR != rc ) {
-        ALOGE("%s: cannot configure AF bracketing", __func__);
+        LOGE("cannot configure AF bracketing");
         return rc;
     }
     if (enable) {
-        mParameters.set3ALock(QCameraParameters::VALUE_TRUE);
+        mParameters.set3ALock(true);
         mIs3ALocked = true;
     }
-    CDBG_HIGH("%s: X",__func__);
+    LOGH("X rc = %d", rc);
     return rc;
 }
 
@@ -3888,7 +4789,7 @@ int32_t QCamera2HardwareInterface::configureAFBracketing(bool enable)
  *==========================================================================*/
 int32_t QCamera2HardwareInterface::configureHDRBracketing()
 {
-    CDBG_HIGH("%s: E",__func__);
+    LOGH("E");
     int32_t rc = NO_ERROR;
 
     cam_hdr_bracketing_info_t& hdrBracketingSetting =
@@ -3897,8 +4798,7 @@ int32_t QCamera2HardwareInterface::configureHDRBracketing()
     // 'values' should be in "idx1,idx2,idx3,..." format
     uint32_t hdrFrameCount =
             hdrBracketingSetting.num_frames;
-    CDBG_HIGH("%s : HDR values %d, %d frame count: %u",
-          __func__,
+    LOGH("HDR values %d, %d frame count: %u",
           (int8_t) hdrBracketingSetting.exp_val.values[0],
           (int8_t) hdrBracketingSetting.exp_val.values[1],
           hdrFrameCount);
@@ -3913,7 +4813,7 @@ int32_t QCamera2HardwareInterface::configureHDRBracketing()
         mHDRBracketingEnabled = true;
     }
 
-    String8 tmp("");
+    String8 tmp;
     for (uint32_t i = 0; i < hdrFrameCount; i++) {
         tmp.appendFormat("%d",
             (int8_t) hdrBracketingSetting.exp_val.values[i]);
@@ -3932,15 +4832,14 @@ int32_t QCamera2HardwareInterface::configureHDRBracketing()
         memcpy(aeBracket.values, tmp.string(), tmp.length() - 1);
     }
 
-    CDBG_HIGH("%s : HDR config values %s",
-          __func__,
+    LOGH("HDR config values %s",
           aeBracket.values);
     rc = mParameters.setHDRAEBracket(aeBracket);
     if ( NO_ERROR != rc ) {
-        ALOGE("%s: cannot configure HDR bracketing", __func__);
+        LOGE("cannot configure HDR bracketing");
         return rc;
     }
-    CDBG_HIGH("%s: X",__func__);
+    LOGH("X rc = %d", rc);
     return rc;
 }
 
@@ -3957,15 +4856,15 @@ int32_t QCamera2HardwareInterface::configureHDRBracketing()
  *==========================================================================*/
 int32_t QCamera2HardwareInterface::configureAEBracketing()
 {
-    CDBG_HIGH("%s: E",__func__);
+    LOGH("E");
     int32_t rc = NO_ERROR;
 
     rc = mParameters.setAEBracketing();
     if ( NO_ERROR != rc ) {
-        ALOGE("%s: cannot configure AE bracketing", __func__);
+        LOGE("cannot configure AE bracketing");
         return rc;
     }
-    CDBG_HIGH("%s: X",__func__);
+    LOGH("X rc = %d", rc);
     return rc;
 }
 
@@ -3990,8 +4889,7 @@ int32_t QCamera2HardwareInterface::configureOptiZoom()
     //set zoom level to 1x;
     mParameters.setAndCommitZoom(0);
 
-    mParameters.set3ALock(QCameraParameters::VALUE_TRUE);
-
+    mParameters.set3ALock(true);
     mIs3ALocked = true;
 
     return rc;
@@ -4019,42 +4917,89 @@ int32_t QCamera2HardwareInterface::configureStillMore()
     if (!mParameters.isSeeMoreEnabled() && !mParameters.isLTMForSeeMoreEnabled()) {
         rc = mParameters.setToneMapMode(false, true);
         if (rc != NO_ERROR) {
-            CDBG_HIGH("%s: Failed to disable tone map during StillMore", __func__);
+            LOGW("Failed to disable tone map during StillMore");
         }
     }
 
     /* Lock 3A */
-    mParameters.set3ALock(QCameraParameters::VALUE_TRUE);
+    mParameters.set3ALock(true);
     mIs3ALocked = true;
 
     /* Disable Tintless */
     mParameters.setTintless(false);
 
-    /* Configure burst count based on user input */
-    char prop[PROPERTY_VALUE_MAX];
-    property_get("persist.camera.imglib.stillmore", prop, "0");
-    burst_cnt = (uint32_t)atoi(prop);
+    /* Initialize burst count from capability */
+    stillmore_cap = mParameters.getStillMoreCapability();
+    burst_cnt = stillmore_cap.max_burst_count;
 
-    /* In the case of liveshot, burst should be 1 */
+    /* Reconfigure burst count from dynamic scene data */
+    cam_dyn_img_data_t dynamic_img_data = mParameters.getDynamicImgData();
+    if (dynamic_img_data.input_count >= stillmore_cap.min_burst_count &&
+            dynamic_img_data.input_count <= stillmore_cap.max_burst_count) {
+        burst_cnt = dynamic_img_data.input_count;
+    }
+
+    /* Reconfigure burst count in the case of liveshot */
     if (mParameters.isSeeMoreEnabled()) {
         burst_cnt = 1;
     }
 
-    /* Validate burst count */
-    stillmore_cap = mParameters.getStillMoreCapability();
-    if ((burst_cnt < stillmore_cap.min_burst_count) ||
-            (burst_cnt > stillmore_cap.max_burst_count)) {
-        burst_cnt = stillmore_cap.max_burst_count;
+    /* Reconfigure burst count from user input */
+    char prop[PROPERTY_VALUE_MAX];
+    property_get("persist.vendor.camera.imglib.stillmore", prop, "0");
+    uint8_t burst_setprop = (uint32_t)atoi(prop);
+    if (burst_setprop != 0)  {
+       if ((burst_setprop < stillmore_cap.min_burst_count) ||
+               (burst_setprop > stillmore_cap.max_burst_count)) {
+           burst_cnt = stillmore_cap.max_burst_count;
+       } else {
+           burst_cnt = burst_setprop;
+       }
     }
 
     memset(&stillmore_config, 0, sizeof(cam_still_more_t));
     stillmore_config.burst_count = burst_cnt;
     mParameters.setStillMoreSettings(stillmore_config);
 
-    CDBG_HIGH("%s: Stillmore burst %d", __func__, burst_cnt);
+    LOGH("Stillmore burst %d", burst_cnt);
 
     return rc;
 }
+
+/*===========================================================================
+ * FUNCTION   : configureHalPostProcess
+ *
+ * DESCRIPTION: config hal postproc (HALPP) for current snapshot.
+ *
+ * PARAMETERS : none
+ *
+ * RETURN     : int32_t type of status
+ *              NO_ERROR  -- success
+ *              none-zero failure code
+ *==========================================================================*/
+int32_t QCamera2HardwareInterface::configureHalPostProcess()
+{
+    LOGD("E");
+    int32_t rc = NO_ERROR;
+
+    if (!m_postprocessor.isHalPPEnabled()) {
+        m_bNeedHalPP = FALSE;
+        return rc;
+    }
+
+    /* check if halpp is needed in dual camera mode */
+    if (isDualCamera()) {
+        if (mBundledSnapshot) {
+            LOGH("Use HALPP for dual camera bundle snapshot.");
+            m_bNeedHalPP = TRUE;
+        }
+        return rc;
+    }
+
+    return rc;
+    LOGD("X");
+}
+
 
 /*===========================================================================
  * FUNCTION   : stopAdvancedCapture
@@ -4071,24 +5016,31 @@ int32_t QCamera2HardwareInterface::configureStillMore()
 int32_t QCamera2HardwareInterface::stopAdvancedCapture(
         QCameraPicChannel *pChannel)
 {
-    CDBG_HIGH("%s: stop bracketig",__func__);
+    LOGH("stop bracketig");
     int32_t rc = NO_ERROR;
 
     if(mParameters.isUbiFocusEnabled() || mParameters.isUbiRefocus()) {
         rc = pChannel->stopAdvancedCapture(MM_CAMERA_AF_BRACKETING);
-    } else if (mParameters.isChromaFlashEnabled() || mFlashNeeded) {
+    } else if (mParameters.isChromaFlashEnabled()
+            || (mFlashConfigured && !mLongshotEnabled)
+            || (mLowLightConfigured == true)
+            || (mParameters.getManualCaptureMode() >= CAM_MANUAL_CAPTURE_TYPE_2)) {
         rc = pChannel->stopAdvancedCapture(MM_CAMERA_FRAME_CAPTURE);
+        mFlashConfigured = false;
+        mLowLightConfigured = false;
     } else if(mParameters.isHDREnabled()
             || mParameters.isAEBracketEnabled()) {
         rc = pChannel->stopAdvancedCapture(MM_CAMERA_AE_BRACKETING);
     } else if (mParameters.isOptiZoomEnabled()) {
         rc = pChannel->stopAdvancedCapture(MM_CAMERA_ZOOM_1X);
     } else if (mParameters.isStillMoreEnabled()) {
-        CDBG_HIGH("%s: stopAdvancedCapture not needed for StillMore", __func__);
+        LOGH("stopAdvancedCapture not needed for StillMore");
     } else {
-        ALOGE("%s: No Advanced Capture feature enabled!",__func__);
+        LOGH("No Advanced Capture feature enabled!");
         rc = BAD_VALUE;
     }
+
+    m_bNeedHalPP = FALSE;
     return rc;
 }
 
@@ -4107,7 +5059,7 @@ int32_t QCamera2HardwareInterface::stopAdvancedCapture(
 int32_t QCamera2HardwareInterface::startAdvancedCapture(
         QCameraPicChannel *pChannel)
 {
-    CDBG_HIGH("%s: Start bracketing",__func__);
+    LOGH("Start bracketing");
     int32_t rc = NO_ERROR;
 
     if(mParameters.isUbiFocusEnabled() || mParameters.isUbiRefocus()) {
@@ -4115,15 +5067,18 @@ int32_t QCamera2HardwareInterface::startAdvancedCapture(
     } else if (mParameters.isOptiZoomEnabled()) {
         rc = pChannel->startAdvancedCapture(MM_CAMERA_ZOOM_1X);
     } else if (mParameters.isStillMoreEnabled()) {
-        CDBG_HIGH("%s: startAdvancedCapture not needed for StillMore", __func__);
+        LOGH("startAdvancedCapture not needed for StillMore");
     } else if (mParameters.isHDREnabled()
             || mParameters.isAEBracketEnabled()) {
         rc = pChannel->startAdvancedCapture(MM_CAMERA_AE_BRACKETING);
-    } else if (mParameters.isChromaFlashEnabled() || mFlashNeeded) {
+    } else if (mParameters.isChromaFlashEnabled()
+            || (mFlashNeeded && !mLongshotEnabled)
+            || (mLowLightConfigured == true)
+            || (mParameters.getManualCaptureMode() >= CAM_MANUAL_CAPTURE_TYPE_2)) {
         cam_capture_frame_config_t config = mParameters.getCaptureFrameConfig();
         rc = pChannel->startAdvancedCapture(MM_CAMERA_FRAME_CAPTURE, &config);
     } else {
-        ALOGE("%s: No Advanced Capture feature enabled!",__func__);
+        LOGE("No Advanced Capture feature enabled!");
         rc = BAD_VALUE;
     }
     return rc;
@@ -4143,17 +5098,15 @@ int32_t QCamera2HardwareInterface::startAdvancedCapture(
 int QCamera2HardwareInterface::preTakePicture()
 {
     int32_t rc = NO_ERROR;
-    CDBG_HIGH("%s: E", __func__);
+    LOGH("E");
     if (mParameters.getRecordingHintValue() == true) {
 
         // Give HWI control to restart preview only in single camera mode.
         // In dual-cam mode, this control belongs to muxer.
         if (getRelatedCamSyncInfo()->sync_control != CAM_SYNC_RELATED_SENSORS_ON) {
-            CDBG_HIGH("%s: restart preview if rec hint is true and preview is running", __func__);
+            LOGH("restart preview if rec hint is true and preview is running");
             stopPreview();
-            pthread_mutex_lock(&m_parm_lock);
             mParameters.updateRecordingHintValue(FALSE);
-            pthread_mutex_unlock(&m_parm_lock);
             // start preview again
             rc = preparePreview();
             if (rc == NO_ERROR) {
@@ -4171,7 +5124,11 @@ int QCamera2HardwareInterface::preTakePicture()
         }
     }
 
-    CDBG_HIGH("%s: X", __func__);
+    if (isDualCamera()) {
+        //Send capture request to modules
+        mParameters.updateCaptureRequest(1);
+    }
+    LOGH("X rc = %d", rc);
     return rc;
 }
 
@@ -4192,10 +5149,9 @@ int QCamera2HardwareInterface::takePicture()
 
     // Get total number for snapshots (retro + regular)
     uint8_t numSnapshots = mParameters.getNumOfSnapshots();
-    uint8_t numAdvancedSnapshot = mParameters.getBurstCountForAdvancedCapture();
     // Get number of retro-active snapshots
     uint8_t numRetroSnapshots = mParameters.getNumOfRetroSnapshots();
-    CDBG_HIGH("%s: E", __func__);
+    LOGH("E");
 
     //Set rotation value from user settings as Jpeg rotation
     //to configure back-end modules.
@@ -4204,31 +5160,69 @@ int QCamera2HardwareInterface::takePicture()
     // Check if retro-active snapshots are not enabled
     if (!isRetroPicture() || !mParameters.isZSLMode()) {
       numRetroSnapshots = 0;
-      CDBG_HIGH("%s: [ZSL Retro] Reset retro snaphot count to zero", __func__);
+      LOGH("Reset retro snaphot count to zero");
     }
-    if (mParameters.isUbiFocusEnabled() ||
-            mParameters.isUbiRefocus() ||
-            mParameters.isOptiZoomEnabled() ||
-            mParameters.isHDREnabled() ||
-            mParameters.isChromaFlashEnabled() ||
-            mParameters.isAEBracketEnabled() ||
-            mParameters.isStillMoreEnabled()) {
-        rc = configureAdvancedCapture();
-        if (rc == NO_ERROR) {
-            numSnapshots = numAdvancedSnapshot;
+
+    //Do special configure for advanced capture modes.
+    rc = configureAdvancedCapture();
+    if (rc != NO_ERROR) {
+        LOGE("Unsupported capture call");
+        return rc;
+    }
+
+    if (mAdvancedCaptureConfigured) {
+        numSnapshots = mParameters.getBurstCountForAdvancedCapture();
+    }
+
+    if (mBundledSnapshot) {
+        // Force both the cameras to stream to get the bundled snapshot
+        if (mActiveCameras != MM_CAMERA_DUAL_CAM) {
+            forceCameraWakeup();
+        }
+        if (mActiveCameras == MM_CAMERA_DUAL_CAM) {
+            char prop[PROPERTY_VALUE_MAX];
+            memset(prop, 0, sizeof(prop));
+            property_get("persist.vendor.camera.dualfov.jpegnum", prop, "1");
+            int dualfov_snap_num = atoi(prop);
+
+            if(mParameters.getHalPPType() == CAM_HAL_PP_TYPE_NONE) {
+                dualfov_snap_num = MM_CAMERA_MAX_CAM_CNT;
+            } else if (mParameters.getHalPPType() == CAM_HAL_PP_TYPE_BOKEH) {
+                dualfov_snap_num = NUM_BOKEH_OUTPUT;
+            }
+
+            dualfov_snap_num = (dualfov_snap_num == 0) ? 1 : dualfov_snap_num;
+            LOGD("dualfov_snap_num:%d", dualfov_snap_num);
+            numSnapshots /= dualfov_snap_num;
+
+            if(mParameters.getHalPPType() == CAM_HAL_PP_TYPE_CLEARSIGHT) {
+                numSnapshots *= MIN_CLEARSIGHT_BUFS;
+            }
         }
     }
-    CDBG_HIGH("%s: [ZSL Retro] numSnapshots = %d, numRetroSnapshots = %d",
-          __func__, numSnapshots, numRetroSnapshots);
+
+    LOGI("snap count = %d zsl = %d advanced = %d, active camera:%d mMasterCamera:%d",
+            numSnapshots, mParameters.isZSLMode(), mAdvancedCaptureConfigured,
+            mActiveCameras, mMasterCamera);
 
     if (mParameters.isZSLMode()) {
-        QCameraPicChannel *pZSLChannel =
-            (QCameraPicChannel *)m_channels[QCAMERA_CH_TYPE_ZSL];
-        if (NULL != pZSLChannel) {
+        QCameraChannel *pChannel = m_channels[QCAMERA_CH_TYPE_ZSL];
+        QCameraPicChannel *pPicChannel = (QCameraPicChannel *)pChannel;
+        if (NULL != pPicChannel) {
 
-            rc = configureOnlineRotation(*pZSLChannel);
+            if (mParameters.getofflineRAW() && !mParameters.getRawZsl()) {
+                startRAWChannel(pPicChannel);
+                pPicChannel = (QCameraPicChannel *)m_channels[QCAMERA_CH_TYPE_RAW];
+                if (pPicChannel == NULL) {
+                    LOGE("RAW Channel is NULL in Manual capture mode");
+                    stopRAWChannel();
+                    return UNKNOWN_ERROR;
+                }
+            }
+
+            rc = configureOnlineRotation(*pPicChannel);
             if (rc != NO_ERROR) {
-                ALOGE("%s: online rotation failed", __func__);
+                LOGE("online rotation failed");
                 return rc;
             }
 
@@ -4236,7 +5230,7 @@ int QCamera2HardwareInterface::takePicture()
             DeferWorkArgs args;
             memset(&args, 0, sizeof(DeferWorkArgs));
 
-            args.pprocArgs = pZSLChannel;
+            args.pprocArgs = pPicChannel;
 
             // No need to wait for mInitPProcJob here, because it was
             // queued in startPreview, and will definitely be processed before
@@ -4244,117 +5238,152 @@ int QCamera2HardwareInterface::takePicture()
             mReprocJob = queueDeferredWork(CMD_DEF_PPROC_START,
                     args);
             if (mReprocJob == 0) {
-                ALOGE("%s: Failure: Unable to start pproc", __func__);
-                return UNKNOWN_ERROR;
+                LOGE("Failure: Unable to start pproc");
+                return -ENOMEM;
             }
+
+            // Check if all preview buffers are mapped before creating
+            // a jpeg session as preview stream buffers are queried during the same
+            uint8_t numStreams = pChannel->getNumOfStreams();
+            QCameraStream *pStream = NULL;
+            QCameraStream *pPreviewStream = NULL;
+            for (uint8_t i = 0 ; i < numStreams ; i++ ) {
+                pStream = pChannel->getStreamByIndex(i);
+                if (!pStream)
+                    continue;
+                if (CAM_STREAM_TYPE_PREVIEW == pStream->getMyType()) {
+                    pPreviewStream = pStream;
+                    break;
+                }
+            }
+            if (pPreviewStream != NULL) {
+                Mutex::Autolock l(mMapLock);
+                QCameraMemory *pMemory = pStream->getStreamBufs();
+                if (!pMemory) {
+                    LOGE("Error!! pMemory is NULL");
+                    return -ENOMEM;
+                }
+
+                uint8_t waitCnt = 2;
+                while (!pMemory->checkIfAllBuffersMapped() && (waitCnt > 0)) {
+                    LOGL(" Waiting for preview buffers to be mapped");
+                    mMapCond.waitRelative(
+                            mMapLock, CAMERA_DEFERRED_MAP_BUF_TIMEOUT);
+                    LOGL("Wait completed!!");
+                    waitCnt--;
+                }
+                // If all buffers are not mapped after retries, assert
+                assert(pMemory->checkIfAllBuffersMapped());
+            } else {
+                assert(pPreviewStream);
+            }
+
             // Create JPEG session
             mJpegJob = queueDeferredWork(CMD_DEF_CREATE_JPEG_SESSION,
                     args);
             if (mJpegJob == 0) {
-                ALOGE("%s: Failure: Unable to create jpeg session", __func__);
-                return UNKNOWN_ERROR;
+                LOGE("Failed to queue CREATE_JPEG_SESSION");
+                if (NO_ERROR != waitDeferredWork(mReprocJob)) {
+                        LOGE("Reprocess Deferred work was failed");
+                }
+                m_postprocessor.stop();
+                return -ENOMEM;
             }
 
-            if (mParameters.isUbiFocusEnabled() ||
-                    mParameters.isUbiRefocus() ||
-                    mParameters.isOptiZoomEnabled() ||
-                    mParameters.isHDREnabled() ||
-                    mParameters.isChromaFlashEnabled() ||
-                    mParameters.isAEBracketEnabled() ||
-                    mParameters.isStillMoreEnabled()) {
-                rc = startAdvancedCapture(pZSLChannel);
+            if (mAdvancedCaptureConfigured) {
+                rc = startAdvancedCapture(pPicChannel);
                 if (rc != NO_ERROR) {
-                    ALOGE("%s: cannot start zsl advanced capture", __func__);
+                    LOGE("cannot start zsl advanced capture");
                     return rc;
                 }
             }
             if (mLongshotEnabled && mPrepSnapRun) {
                 mCameraHandle->ops->start_zsl_snapshot(
                         mCameraHandle->camera_handle,
-                        pZSLChannel->getMyHandle());
+                        pPicChannel->getMyHandle());
             }
             // If frame sync is ON and it is a SECONDARY camera,
             // we do not need to send the take picture command to interface
             // It will be handled along with PRIMARY camera takePicture request
             mm_camera_req_buf_t buf;
             memset(&buf, 0x0, sizeof(buf));
-            if ((getRelatedCamSyncInfo()->is_frame_sync_enabled) &&
-                    m_bMpoEnabled) {
+            if ((!mParameters.isAdvCamFeaturesEnabled() &&
+                    !mFlashNeeded &&
+                    !isLongshotEnabled() &&
+                    isFrameSyncEnabled()) &&
+                    (getRelatedCamSyncInfo()->sync_control ==
+                    CAM_SYNC_RELATED_SENSORS_ON)) {
                 if (getRelatedCamSyncInfo()->mode == CAM_MODE_PRIMARY) {
                     buf.type = MM_CAMERA_REQ_FRAME_SYNC_BUF;
                     buf.num_buf_requested = numSnapshots;
-                    rc = pZSLChannel->takePicture(&buf);
+                    rc = pPicChannel->takePicture(&buf);
                     if (rc != NO_ERROR) {
-                        ALOGE("%s: FS_DBG cannot take ZSL picture, stop pproc",
-                                __func__);
-                        waitDeferredWork(mReprocJob);
-                        waitDeferredWork(mJpegJob);
+                        LOGE("FS_DBG cannot take ZSL picture, stop pproc");
+                        if (NO_ERROR != waitDeferredWork(mReprocJob)) {
+                            LOGE("Reprocess Deferred work failed");
+                            return UNKNOWN_ERROR;
+                        }
+                        if (NO_ERROR != waitDeferredWork(mJpegJob)) {
+                            LOGE("Jpeg Deferred work failed");
+                            return UNKNOWN_ERROR;
+                        }
                         m_postprocessor.stop();
                         return rc;
                     }
-                    ALOGI("%s: PRIMARY camera: send frame sync takePicture!!",
-                            __func__);
+                    LOGI("PRIMARY camera: send frame sync takePicture!!");
                 }
             } else {
                 buf.type = MM_CAMERA_REQ_SUPER_BUF;
                 buf.num_buf_requested = numSnapshots;
                 buf.num_retro_buf_requested = numRetroSnapshots;
-                rc = pZSLChannel->takePicture(&buf);
+                rc = pPicChannel->takePicture(&buf);
                 if (rc != NO_ERROR) {
-                    ALOGE("%s: cannot take ZSL picture, stop pproc", __func__);
-                    waitDeferredWork(mReprocJob);
-                    waitDeferredWork(mJpegJob);
+                    LOGE("cannot take ZSL picture, stop pproc");
+                        if (NO_ERROR != waitDeferredWork(mReprocJob)) {
+                            LOGE("Reprocess Deferred work failed");
+                            return UNKNOWN_ERROR;
+                        }
+                        if (NO_ERROR != waitDeferredWork(mJpegJob)) {
+                            LOGE("Jpeg Deferred work failed");
+                            return UNKNOWN_ERROR;
+                        }
                     m_postprocessor.stop();
                     return rc;
                 }
             }
         } else {
-            ALOGE("%s: ZSL channel is NULL", __func__);
+            LOGE("ZSL channel is NULL");
             return UNKNOWN_ERROR;
         }
     } else {
 
         // start snapshot
         if (mParameters.isJpegPictureFormat() ||
-            mParameters.isNV16PictureFormat() ||
-            mParameters.isNV21PictureFormat()) {
+                mParameters.isNV16PictureFormat() ||
+                mParameters.isNV21PictureFormat()) {
 
-            if (!isLongshotEnabled()) {
+            //STOP Preview for Non ZSL use case
+            stopPreview();
 
-                // normal capture case
-                // need to stop preview channel
-                stopChannel(QCAMERA_CH_TYPE_PREVIEW);
-                delChannel(QCAMERA_CH_TYPE_PREVIEW);
-
-                rc = declareSnapshotStreams();
-                if (NO_ERROR != rc) {
-                    return rc;
-                }
-
-                rc = addCaptureChannel();
-            } else {
-                // normal capture case
-                // need to stop preview channel
-
-                stopChannel(QCAMERA_CH_TYPE_PREVIEW);
-                delChannel(QCAMERA_CH_TYPE_PREVIEW);
-
-                rc = declareSnapshotStreams();
-                if (NO_ERROR != rc) {
-                    return rc;
-                }
-
-                rc = addCaptureChannel();
+            //Config CAPTURE channels
+            rc = declareSnapshotStreams();
+            if (NO_ERROR != rc) {
+                return rc;
             }
 
+            rc = addCaptureChannel();
             if ((rc == NO_ERROR) &&
-                (NULL != m_channels[QCAMERA_CH_TYPE_CAPTURE])) {
+                    (NULL != m_channels[QCAMERA_CH_TYPE_CAPTURE])) {
+
+                if (isDualCamera()) {
+                    updateDCSettings();
+                }
 
                 if (!mParameters.getofflineRAW()) {
                     rc = configureOnlineRotation(
                         *m_channels[QCAMERA_CH_TYPE_CAPTURE]);
                     if (rc != NO_ERROR) {
-                        ALOGE("%s: online rotation failed", __func__);
+                        LOGE("online rotation failed");
                         delChannel(QCAMERA_CH_TYPE_CAPTURE);
                         return rc;
                     }
@@ -4371,20 +5400,34 @@ int QCamera2HardwareInterface::takePicture()
                 mReprocJob = queueDeferredWork(CMD_DEF_PPROC_START,
                         args);
                 if (mReprocJob == 0) {
-                    ALOGE("%s: Failure: Unable to start pproc", __func__);
-                    return UNKNOWN_ERROR;
+                    LOGE("Failure: Unable to start pproc");
+                    return -ENOMEM;
                 }
 
                 // Create JPEG session
                 mJpegJob = queueDeferredWork(CMD_DEF_CREATE_JPEG_SESSION,
                         args);
+                if (mJpegJob == 0) {
+                    LOGE("Failed to queue CREATE_JPEG_SESSION");
+                    if (NO_ERROR != waitDeferredWork(mReprocJob)) {
+                        LOGE("Reprocess Deferred work was failed");
+                    }
+                    m_postprocessor.stop();
+                    return -ENOMEM;
+                }
 
                 // start catpure channel
                 rc =  m_channels[QCAMERA_CH_TYPE_CAPTURE]->start();
                 if (rc != NO_ERROR) {
-                    ALOGE("%s: cannot start capture channel", __func__);
-                    waitDeferredWork(mReprocJob);
-                    waitDeferredWork(mJpegJob);
+                    LOGE("cannot start capture channel");
+                    if (NO_ERROR != waitDeferredWork(mReprocJob)) {
+                        LOGE("Reprocess Deferred work failed");
+                        return UNKNOWN_ERROR;
+                    }
+                    if (NO_ERROR != waitDeferredWork(mJpegJob)) {
+                        LOGE("Jpeg Deferred work failed");
+                        return UNKNOWN_ERROR;
+                    }
                     delChannel(QCAMERA_CH_TYPE_CAPTURE);
                     return rc;
                 }
@@ -4397,7 +5440,7 @@ int QCamera2HardwareInterface::takePicture()
                             mParameters.isChromaFlashEnabled()) {
                         rc = startAdvancedCapture(pCapChannel);
                         if (rc != NO_ERROR) {
-                            ALOGE("%s: cannot start advanced capture", __func__);
+                            LOGE("cannot start advanced capture");
                             return rc;
                         }
                     }
@@ -4405,66 +5448,71 @@ int QCamera2HardwareInterface::takePicture()
                 if ( mLongshotEnabled ) {
                     rc = longShot();
                     if (NO_ERROR != rc) {
-                        waitDeferredWork(mReprocJob);
-                        waitDeferredWork(mJpegJob);
+                        if (NO_ERROR != waitDeferredWork(mReprocJob)) {
+                            LOGE("Reprocess Deferred work failed");
+                            return UNKNOWN_ERROR;
+                        }
+                        if (NO_ERROR != waitDeferredWork(mJpegJob)) {
+                            LOGE("Jpeg Deferred work failed");
+                            return UNKNOWN_ERROR;
+                        }
                         delChannel(QCAMERA_CH_TYPE_CAPTURE);
                         return rc;
                     }
                 }
             } else {
-                ALOGE("%s: cannot add capture channel", __func__);
+                LOGE("cannot add capture channel");
                 delChannel(QCAMERA_CH_TYPE_CAPTURE);
                 return rc;
             }
         } else {
+            // Stop Preview before taking NZSL snapshot
+            stopPreview();
 
-            stopChannel(QCAMERA_CH_TYPE_PREVIEW);
-            delChannel(QCAMERA_CH_TYPE_PREVIEW);
-
-            pthread_mutex_lock(&m_parm_lock);
             rc = mParameters.updateRAW(gCamCapability[mCameraId]->raw_dim[0]);
-            pthread_mutex_unlock(&m_parm_lock);
             if (NO_ERROR != rc) {
-                ALOGE("%s: Raw dimension update failed %d", __func__, rc);
+                LOGE("Raw dimension update failed %d", rc);
                 return rc;
             }
 
             rc = declareSnapshotStreams();
             if (NO_ERROR != rc) {
-                ALOGE("%s: RAW stream info configuration failed %d",
-                        __func__,
-                        rc);
+                LOGE("RAW stream info configuration failed %d", rc);
                 return rc;
             }
 
-            rc = addRawChannel();
+            rc = addChannel(QCAMERA_CH_TYPE_RAW);
             if (rc == NO_ERROR) {
                 // start postprocessor
-                waitDeferredWork(mInitPProcJob);
+                if (NO_ERROR != waitDeferredWork(mInitPProcJob)) {
+                    LOGE("Reprocess Deferred work failed");
+                    return UNKNOWN_ERROR;
+                }
+
                 rc = m_postprocessor.start(m_channels[QCAMERA_CH_TYPE_RAW]);
                 if (rc != NO_ERROR) {
-                    ALOGE("%s: cannot start postprocessor", __func__);
+                    LOGE("cannot start postprocessor");
                     delChannel(QCAMERA_CH_TYPE_RAW);
                     return rc;
                 }
 
                 rc = startChannel(QCAMERA_CH_TYPE_RAW);
                 if (rc != NO_ERROR) {
-                    ALOGE("%s: cannot start raw channel", __func__);
+                    LOGE("cannot start raw channel");
                     m_postprocessor.stop();
                     delChannel(QCAMERA_CH_TYPE_RAW);
                     return rc;
                 }
             } else {
-                ALOGE("%s: cannot add raw channel", __func__);
+                LOGE("cannot add raw channel");
                 return rc;
             }
         }
     }
 
     //When take picture, stop sending preview callbacks to APP
-    mParameters.setPreviewCallbackNeeded(false);
-    CDBG_HIGH("%s: X", __func__);
+    m_stateMachine.setPreviewCallbackNeeded(false);
+    LOGI("X rc = %d", rc);
     return rc;
 }
 
@@ -4489,28 +5537,26 @@ int32_t QCamera2HardwareInterface::configureOnlineRotation(QCameraChannel &ch)
     for (uint8_t i = 0; i < ch.getNumOfStreams(); i++) {
         QCameraStream *stream = ch.getStreamByIndex(i);
         if ((NULL != stream) &&
-                (CAM_STREAM_TYPE_SNAPSHOT == stream->getMyType())) {
+                ((CAM_STREAM_TYPE_SNAPSHOT == stream->getMyType())
+                || (CAM_STREAM_TYPE_RAW == stream->getMyType()))) {
             pStream = stream;
             break;
         }
     }
 
     if (NULL == pStream) {
-        ALOGE("%s: No snapshot stream found!", __func__);
+        LOGE("No snapshot stream found!");
         return BAD_VALUE;
     }
 
     streamId = pStream->getMyServerID();
     // Update online rotation configuration
-    pthread_mutex_lock(&m_parm_lock);
     rc = mParameters.addOnlineRotation(mParameters.getJpegRotation(), streamId,
             mParameters.getDeviceRotation());
     if (rc != NO_ERROR) {
-        ALOGE("%s: addOnlineRotation failed %d", __func__, rc);
-        pthread_mutex_unlock(&m_parm_lock);
+        LOGE("addOnlineRotation failed %d", rc);
         return rc;
     }
-    pthread_mutex_unlock(&m_parm_lock);
 
     return rc;
 }
@@ -4531,15 +5577,15 @@ int32_t QCamera2HardwareInterface::declareSnapshotStreams()
     int rc = NO_ERROR;
 
     // Update stream info configuration
-    pthread_mutex_lock(&m_parm_lock);
     rc = mParameters.setStreamConfigure(true, mLongshotEnabled, false);
     if (rc != NO_ERROR) {
-        ALOGE("%s: setStreamConfigure failed %d", __func__, rc);
-        pthread_mutex_unlock(&m_parm_lock);
+        LOGE("setStreamConfigure failed %d", rc);
         return rc;
     }
-    pthread_mutex_unlock(&m_parm_lock);
 
+    if (isDualCamera()) {
+        initDCSettings();
+    }
     return rc;
 }
 
@@ -4574,7 +5620,7 @@ int32_t QCamera2HardwareInterface::longShot()
         buf.num_buf_requested = numSnapshots;
         rc = pChannel->takePicture(&buf);
     } else {
-        ALOGE(" %s : Capture channel not initialized!", __func__);
+        LOGE("Capture channel not initialized!");
         rc = NO_INIT;
         goto end;
     }
@@ -4602,6 +5648,7 @@ int QCamera2HardwareInterface::stopCaptureChannel(bool destroy)
     if (mParameters.isJpegPictureFormat() ||
         mParameters.isNV16PictureFormat() ||
         mParameters.isNV21PictureFormat()) {
+        mParameters.setQuadraCfaMode(false, true);
         rc = stopChannel(QCAMERA_CH_TYPE_CAPTURE);
         if (destroy && (NO_ERROR == rc)) {
             // Destroy camera channel but dont release context
@@ -4632,18 +5679,26 @@ int QCamera2HardwareInterface::cancelPicture()
     //stop post processor
     m_postprocessor.stop();
 
-    pthread_mutex_lock(&m_parm_lock);
-    unconfigureAdvancedCapture();
-    pthread_mutex_unlock(&m_parm_lock);
+    if (isDualCamera()) {
+        //Send cancel capture request to modules
+        mParameters.updateCaptureRequest(0);
+    }
 
-    mParameters.setDisplayFrame(TRUE);
+    unconfigureAdvancedCapture();
+    LOGH("Enable display frames again");
+    setDisplaySkip(FALSE);
 
     if (mParameters.isZSLMode()) {
-        QCameraPicChannel *pZSLChannel =
-            (QCameraPicChannel *)m_channels[QCAMERA_CH_TYPE_ZSL];
-        if (NULL != pZSLChannel) {
-            stopAdvancedCapture(pZSLChannel);
-            pZSLChannel->cancelPicture();
+        QCameraPicChannel *pPicChannel = NULL;
+        if (mParameters.getofflineRAW() && !mParameters.getRawZsl()) {
+            pPicChannel = (QCameraPicChannel *)m_channels[QCAMERA_CH_TYPE_RAW];
+        } else {
+            pPicChannel = (QCameraPicChannel *)m_channels[QCAMERA_CH_TYPE_ZSL];
+        }
+        if (NULL != pPicChannel) {
+            pPicChannel->cancelPicture();
+            stopRAWChannel();
+            stopAdvancedCapture(pPicChannel);
         }
     } else {
 
@@ -4681,12 +5736,12 @@ void QCamera2HardwareInterface::captureDone()
         payload->evt_type = QCAMERA_INTERNAL_EVT_ZSL_CAPTURE_DONE;
         int32_t rc = processEvt(QCAMERA_SM_EVT_EVT_INTERNAL, payload);
         if (rc != NO_ERROR) {
-            ALOGE("%s: processEvt ZSL capture done failed", __func__);
+            LOGE("processEvt ZSL capture done failed");
             free(payload);
             payload = NULL;
         }
     } else {
-        ALOGE("%s: No memory for ZSL capture done event", __func__);
+        LOGE("No memory for ZSL capture done event");
     }
 }
 
@@ -4704,10 +5759,14 @@ void* Live_Snapshot_thread (void* data)
 
     QCamera2HardwareInterface *hw = reinterpret_cast<QCamera2HardwareInterface *>(data);
     if (!hw) {
-        ALOGE("take_picture_thread: NULL camera device");
+        LOGE("take_picture_thread: NULL camera device");
         return (void *)BAD_VALUE;
     }
-    hw->takeLiveSnapshot_internal();
+    if (hw->bLiveSnapshot) {
+        hw->takeLiveSnapshot_internal();
+    } else {
+        hw->cancelLiveSnapshot_internal();
+    }
     return (void* )NULL;
 }
 
@@ -4727,7 +5786,7 @@ void* Int_Pic_thread (void* data)
     QCamera2HardwareInterface *hw = reinterpret_cast<QCamera2HardwareInterface *>(data);
 
     if (!hw) {
-        ALOGE("take_picture_thread: NULL camera device");
+        LOGE("take_picture_thread: NULL camera device");
         return (void *)BAD_VALUE;
     }
 
@@ -4761,6 +5820,11 @@ void* Int_Pic_thread (void* data)
 int QCamera2HardwareInterface::takeLiveSnapshot()
 {
     int rc = NO_ERROR;
+    if (mLiveSnapshotThread != 0) {
+        pthread_join(mLiveSnapshotThread,NULL);
+        mLiveSnapshotThread = 0;
+    }
+    bLiveSnapshot = true;
     rc= pthread_create(&mLiveSnapshotThread, NULL, Live_Snapshot_thread, (void *) this);
     if (!rc) {
         pthread_setname_np(mLiveSnapshotThread, "CAM_liveSnap");
@@ -4806,10 +5870,12 @@ void QCamera2HardwareInterface::checkIntPicPending(bool JpegMemOpt, char *raw_fo
     int rc = NO_ERROR;
 
     struct timespec   ts;
-    struct timeval    tp;
-    gettimeofday(&tp, NULL);
+    struct timespec   tp;
+    if( clock_gettime(CLOCK_MONOTONIC, &tp) < 0) {
+        LOGE("Error reading the monotonic time clock, cannot use timed wait");
+    }
     ts.tv_sec  = tp.tv_sec + 5;
-    ts.tv_nsec = tp.tv_usec * 1000;
+    ts.tv_nsec = tp.tv_nsec;
 
     if (true == m_bIntJpegEvtPending ||
         (true == m_bIntRawEvtPending)) {
@@ -4841,7 +5907,7 @@ void QCamera2HardwareInterface::checkIntPicPending(bool JpegMemOpt, char *raw_fo
             stopChannel(QCAMERA_CH_TYPE_RAW);
             delChannel(QCAMERA_CH_TYPE_RAW);
             //restoring the old raw format
-            property_set("persist.camera.raw.format", raw_format);
+            property_set("persist.vendor.camera.raw.format", raw_format);
         }
 
         if (true == bSendToBackend) {
@@ -4850,9 +5916,7 @@ void QCamera2HardwareInterface::checkIntPicPending(bool JpegMemOpt, char *raw_fo
             memcpy(&params.path[0], &m_BackendFileName[0], QCAMERA_MAX_FILEPATH_LENGTH);
             memset(&m_BackendFileName[0], 0x0, QCAMERA_MAX_FILEPATH_LENGTH);
             params.size = mBackendFileSize;
-            pthread_mutex_lock(&m_parm_lock);
             rc = mParameters.setIntEvent(params);
-            pthread_mutex_unlock(&m_parm_lock);
         }
 
         clearIntPendingEvents();
@@ -4886,27 +5950,30 @@ int QCamera2HardwareInterface::takeBackendPic_internal(bool *JpegMemOpt, char *r
     /* Prepare snapshot in case LED needs to be flashed */
     if (mFlashNeeded == 1 || mParameters.isChromaFlashEnabled()) {
         // Start Preparing for normal Frames
-        CDBG_HIGH("%s: Start Prepare Snapshot", __func__);
+        LOGH("Start Prepare Snapshot");
         /* Prepare snapshot in case LED needs to be flashed */
         rc = processAPI(QCAMERA_SM_EVT_PREPARE_SNAPSHOT, NULL);
         if (rc == NO_ERROR) {
             waitAPIResult(QCAMERA_SM_EVT_PREPARE_SNAPSHOT, &apiResult);
             rc = apiResult.status;
-            CDBG_HIGH("%s: Prep Snapshot done", __func__);
         }
+        LOGH("Prep Snapshot done rc = %d", rc);
         mPrepSnapRun = true;
     }
     unlockAPI();
 
     if (true == m_bIntJpegEvtPending) {
         //Attempting to take JPEG snapshot
-        waitDeferredWork(mInitPProcJob);
+        if (NO_ERROR != waitDeferredWork(mInitPProcJob)) {
+            LOGE("Init PProc Deferred work failed");
+            return UNKNOWN_ERROR;
+        }
         *JpegMemOpt = m_postprocessor.getJpegMemOpt();
         m_postprocessor.setJpegMemOpt(false);
 
         /* capture */
         lockAPI();
-        CDBG_HIGH("%s: Capturing internal snapshot", __func__);
+        LOGH("Capturing internal snapshot");
         rc = processAPI(QCAMERA_SM_EVT_TAKE_PICTURE, NULL);
         if (rc == NO_ERROR) {
             waitAPIResult(QCAMERA_SM_EVT_TAKE_PICTURE, &apiResult);
@@ -4919,30 +5986,33 @@ int QCamera2HardwareInterface::takeBackendPic_internal(bool *JpegMemOpt, char *r
         stopPreview();
 
         //getting the existing raw format type
-        property_get("persist.camera.raw.format", raw_format, "17");
+        property_get("persist.vendor.camera.raw.format", raw_format, "17");
         //setting it to a default know value for this task
-        property_set("persist.camera.raw.format", "18");
+        property_set("persist.vendor.camera.raw.format", "18");
 
-        rc = addRawChannel();
+        rc = addChannel(QCAMERA_CH_TYPE_RAW);
         if (rc == NO_ERROR) {
             // start postprocessor
-            waitDeferredWork(mInitPProcJob);
+            if (NO_ERROR != waitDeferredWork(mInitPProcJob)) {
+                LOGE("Init PProc Deferred work failed");
+                return UNKNOWN_ERROR;
+            }
             rc = m_postprocessor.start(m_channels[QCAMERA_CH_TYPE_RAW]);
             if (rc != NO_ERROR) {
-                ALOGE("%s: cannot start postprocessor", __func__);
+                LOGE("cannot start postprocessor");
                 delChannel(QCAMERA_CH_TYPE_RAW);
                 return rc;
             }
 
             rc = startChannel(QCAMERA_CH_TYPE_RAW);
             if (rc != NO_ERROR) {
-                ALOGE("%s: cannot start raw channel", __func__);
+                LOGE("cannot start raw channel");
                 m_postprocessor.stop();
                 delChannel(QCAMERA_CH_TYPE_RAW);
                 return rc;
             }
         } else {
-            ALOGE("%s: cannot add raw channel", __func__);
+            LOGE("cannot add raw channel");
             return rc;
         }
     }
@@ -5004,23 +6074,19 @@ int QCamera2HardwareInterface::takeLiveSnapshot_internal()
     int rc = NO_ERROR;
 
     QCameraChannel *pChannel = NULL;
+    QCameraChannel *pPreviewChannel = NULL;
+    QCameraStream  *pPreviewStream = NULL;
+    QCameraStream  *pStream = NULL;
 
     //Set rotation value from user settings as Jpeg rotation
     //to configure back-end modules.
     mParameters.setJpegRotation(mParameters.getRotation());
 
     // Configure advanced capture
-    if (mParameters.isUbiFocusEnabled() ||
-            mParameters.isUbiRefocus() ||
-            mParameters.isOptiZoomEnabled() ||
-            mParameters.isHDREnabled() ||
-            mParameters.isChromaFlashEnabled() ||
-            mParameters.isAEBracketEnabled() ||
-            mParameters.isStillMoreEnabled()) {
-        rc = configureAdvancedCapture();
-        if (rc != NO_ERROR) {
-            CDBG_HIGH("%s: configureAdvancedCapture unsuccessful", __func__);
-        }
+    rc = configureAdvancedCapture();
+    if (rc != NO_ERROR) {
+        LOGE("Unsupported capture call");
+        goto end;
     }
 
     if (isLowPowerMode()) {
@@ -5030,17 +6096,124 @@ int QCamera2HardwareInterface::takeLiveSnapshot_internal()
     }
 
     if (NULL == pChannel) {
-        ALOGE("%s: Snapshot/Video channel not initialized", __func__);
+        LOGE("Snapshot/Video channel not initialized");
         rc = NO_INIT;
         goto end;
     }
 
-    // start post processor
-    waitDeferredWork(mInitPProcJob);
-    rc = m_postprocessor.start(pChannel);
+    // Check if all preview buffers are mapped before creating
+    // a jpeg session as preview stream buffers are queried during the same
+    pPreviewChannel = m_channels[QCAMERA_CH_TYPE_PREVIEW];
+    if (pPreviewChannel != NULL) {
+        uint32_t numStreams = pPreviewChannel->getNumOfStreams();
 
-    if (NO_ERROR != rc) {
-        ALOGE("%s: Post-processor start failed %d", __func__, rc);
+        for (uint8_t i = 0 ; i < numStreams ; i++ ) {
+            pStream = pPreviewChannel->getStreamByIndex(i);
+            if (!pStream)
+                continue;
+            if (CAM_STREAM_TYPE_PREVIEW == pStream->getMyType()) {
+                pPreviewStream = pStream;
+                break;
+            }
+        }
+
+        if (pPreviewStream != NULL) {
+            Mutex::Autolock l(mMapLock);
+            QCameraMemory *pMemory = pStream->getStreamBufs();
+            if (!pMemory) {
+                LOGE("Error!! pMemory is NULL");
+                return -ENOMEM;
+            }
+
+            uint8_t waitCnt = 2;
+            while (!pMemory->checkIfAllBuffersMapped() && (waitCnt > 0)) {
+                LOGL(" Waiting for preview buffers to be mapped");
+                mMapCond.waitRelative(
+                        mMapLock, CAMERA_DEFERRED_MAP_BUF_TIMEOUT);
+                LOGL("Wait completed!!");
+                waitCnt--;
+            }
+            // If all buffers are not mapped after retries, assert
+            assert(pMemory->checkIfAllBuffersMapped());
+        } else {
+            assert(pPreviewStream);
+        }
+    }
+
+    // Do not link metadata stream for 4K2k resolution
+    // as CPP processing would be done on snapshot stream and not
+    // reprocess stream
+    if (!isLowPowerMode() && !mParameters.is4k2kVideoResolution()) {
+       // Find and try to link a metadata stream from preview channel
+       QCameraChannel *pMetaChannel = NULL;
+       QCameraStream *pMetaStream = NULL;
+       QCameraStream *pPreviewStream = NULL;
+
+        if (m_channels[QCAMERA_CH_TYPE_PREVIEW] != NULL) {
+           pMetaChannel = m_channels[QCAMERA_CH_TYPE_PREVIEW];
+           uint32_t streamNum = pMetaChannel->getNumOfStreams();
+           QCameraStream *pStream = NULL;
+           for (uint32_t i = 0 ; i < streamNum ; i++ ) {
+               pStream = pMetaChannel->getStreamByIndex(i);
+               if (NULL != pStream) {
+                   if (CAM_STREAM_TYPE_METADATA == pStream->getMyType()) {
+                       pMetaStream = pStream;
+                   } else if ((CAM_STREAM_TYPE_PREVIEW == pStream->getMyType())
+                           && (!mParameters.isHfrMode()) && (!isDualCamera())
+                           && (mParameters.isLinkPreviewForLiveShot())) {
+                       // Do not link preview stream for
+                       // 1)HFR live snapshot,Thumbnail will not be derived from
+                       //   preview for HFR live snapshot.
+                       // 2)Dual Camera since preview & snapshot correction is different
+                       // 3)persist.vendor.camera.linkpreview is 0
+                       pPreviewStream = pStream;
+                   }
+               }
+           }
+       }
+
+       if ((NULL != pMetaChannel) && (NULL != pMetaStream)) {
+           rc = pChannel->linkStream(pMetaChannel, pMetaStream);
+           if (NO_ERROR != rc) {
+               LOGE("Metadata stream link failed %d", rc);
+           }
+       }
+       if ((NULL != pMetaChannel) && (NULL != pPreviewStream)) {
+           rc = pChannel->linkStream(pMetaChannel, pPreviewStream);
+           if (NO_ERROR != rc) {
+               LOGE("Preview stream link failed %d", rc);
+           }
+       }
+    }
+
+
+
+    DeferWorkArgs args;
+    memset(&args, 0, sizeof(DeferWorkArgs));
+
+    args.pprocArgs = pChannel;
+
+    // No need to wait for mInitPProcJob here, because it was
+    // queued in startPreview, and will definitely be processed before
+    // mReprocJob can begin.
+    mReprocJob = queueDeferredWork(CMD_DEF_PPROC_START,
+            args);
+    if (mReprocJob == 0) {
+        LOGE("Failed to queue CMD_DEF_PPROC_START");
+        rc = -ENOMEM;
+        goto end;
+    }
+
+    // Create JPEG session
+    mJpegJob = queueDeferredWork(CMD_DEF_CREATE_JPEG_SESSION,
+            args);
+    if (mJpegJob == 0) {
+        LOGE("Failed to queue CREATE_JPEG_SESSION");
+        if (NO_ERROR != waitDeferredWork(mReprocJob)) {
+            LOGE("Reprocess Deferred work was failed");
+        }
+        m_postprocessor.stop();
+        rc = -ENOMEM;
         goto end;
     }
 
@@ -5057,43 +6230,43 @@ int QCamera2HardwareInterface::takeLiveSnapshot_internal()
     if (!mParameters.is4k2kVideoResolution()) {
         rc = configureOnlineRotation(*m_channels[QCAMERA_CH_TYPE_SNAPSHOT]);
         if (rc != NO_ERROR) {
-            ALOGE("%s: online rotation failed", __func__);
+            LOGE("online rotation failed");
+            if (NO_ERROR != waitDeferredWork(mReprocJob)) {
+                LOGE("Reprocess Deferred work was failed");
+            }
+            if (NO_ERROR != waitDeferredWork(mJpegJob)) {
+                LOGE("Jpeg Deferred work was failed");
+            }
             m_postprocessor.stop();
             return rc;
         }
     }
-    // start snapshot channel
-    if ((rc == NO_ERROR) && (NULL != pChannel)) {
-        // Do not link metadata stream for 4K2k resolution
-        // as CPP processing would be done on snapshot stream and not
-        // reprocess stream
-        if (!mParameters.is4k2kVideoResolution()) {
-            // Find and try to link a metadata stream from preview channel
-            QCameraChannel *pMetaChannel = NULL;
-            QCameraStream *pMetaStream = NULL;
 
-            if (m_channels[QCAMERA_CH_TYPE_PREVIEW] != NULL) {
-                pMetaChannel = m_channels[QCAMERA_CH_TYPE_PREVIEW];
-                uint32_t streamNum = pMetaChannel->getNumOfStreams();
-                QCameraStream *pStream = NULL;
-                for (uint32_t i = 0 ; i < streamNum ; i++ ) {
-                    pStream = pMetaChannel->getStreamByIndex(i);
-                    if ((NULL != pStream) &&
-                            (CAM_STREAM_TYPE_METADATA == pStream->getMyType())) {
-                        pMetaStream = pStream;
-                        break;
-                    }
-                }
-            }
-
-            if ((NULL != pMetaChannel) && (NULL != pMetaStream)) {
-                rc = pChannel->linkStream(pMetaChannel, pMetaStream);
-                if (NO_ERROR != rc) {
-                    ALOGE("%s : Metadata stream link failed %d", __func__, rc);
-                }
+    if ((NULL != pChannel) && (mParameters.isTNRSnapshotEnabled())) {
+        QCameraStream *pStream = NULL;
+        for (uint32_t i = 0 ; i < pChannel->getNumOfStreams(); i++ ) {
+            pStream = pChannel->getStreamByIndex(i);
+            if ((NULL != pStream) &&
+                    (CAM_STREAM_TYPE_SNAPSHOT == pStream->getMyType())) {
+                break;
             }
         }
+        if (pStream != NULL) {
+            LOGD("REQUEST_FRAMES event for TNR snapshot");
+            cam_stream_parm_buffer_t param;
+            memset(&param, 0, sizeof(cam_stream_parm_buffer_t));
+            param.type = CAM_STREAM_PARAM_TYPE_REQUEST_FRAMES;
+            param.frameRequest.enableStream = 1;
+            rc = pStream->setParameter(param);
+            if (rc != NO_ERROR) {
+                LOGE("Stream Event REQUEST_FRAMES failed");
+            }
+            goto end;
+        }
+    }
 
+    // start snapshot channel
+    if ((rc == NO_ERROR) && (NULL != pChannel)) {
         rc = pChannel->start();
     }
 
@@ -5119,75 +6292,72 @@ end:
 int QCamera2HardwareInterface::cancelLiveSnapshot()
 {
     int rc = NO_ERROR;
-
-    pthread_mutex_lock(&m_parm_lock);
-    unconfigureAdvancedCapture();
-    pthread_mutex_unlock(&m_parm_lock);
-
     if (mLiveSnapshotThread != 0) {
         pthread_join(mLiveSnapshotThread,NULL);
         mLiveSnapshotThread = 0;
     }
-
-    //stop post processor
-    m_postprocessor.stop();
-
-    // stop snapshot channel
-    rc = stopChannel(QCAMERA_CH_TYPE_SNAPSHOT);
-
+    bLiveSnapshot = false;
+    rc= pthread_create(&mLiveSnapshotThread, NULL, Live_Snapshot_thread, (void *) this);
+    if (!rc) {
+        pthread_setname_np(mLiveSnapshotThread, "CAM_cancel_liveSnap");
+    }
     return rc;
 }
 
 /*===========================================================================
- * FUNCTION   : getParameters
+ * FUNCTION   : cancelLiveSnapshot_internal
  *
- * DESCRIPTION: get parameters impl
+ * DESCRIPTION: cancel live snapshot during recording
  *
  * PARAMETERS : none
  *
- * RETURN     : a string containing parameter pairs
+ * RETURN     : int32_t type of status
+ *              NO_ERROR  -- success
+ *              none-zero failure code
  *==========================================================================*/
-char* QCamera2HardwareInterface::getParameters()
-{
-    char* strParams = NULL;
-    String8 str("");
+int QCamera2HardwareInterface::cancelLiveSnapshot_internal() {
+    int rc = NO_ERROR;
 
-    int cur_width, cur_height;
-    pthread_mutex_lock(&m_parm_lock);
-    //Need take care Scale picture size
-    if(mParameters.m_reprocScaleParam.isScaleEnabled() &&
-        mParameters.m_reprocScaleParam.isUnderScaling()){
-        int scale_width, scale_height;
+    unconfigureAdvancedCapture();
+    LOGH("Enable display frames again");
+    setDisplaySkip(FALSE);
 
-        mParameters.m_reprocScaleParam.getPicSizeFromAPK(scale_width,scale_height);
-        mParameters.getPictureSize(&cur_width, &cur_height);
+    //wait for deferred (reprocess and jpeg) threads to finish
+    waitDeferredWork(mReprocJob);
+    waitDeferredWork(mJpegJob);
+    //stop post processor
+    m_postprocessor.stop();
 
-        String8 pic_size("");
-        char buffer[32];
-        snprintf(buffer, sizeof(buffer), "%dx%d", scale_width, scale_height);
-        pic_size.append(buffer);
-        mParameters.set(CameraParameters::KEY_PICTURE_SIZE, pic_size);
+    // stop snapshot channel
+    if (!mParameters.isTNRSnapshotEnabled()) {
+        rc = stopChannel(QCAMERA_CH_TYPE_SNAPSHOT);
+    } else {
+        QCameraChannel *pChannel = m_channels[QCAMERA_CH_TYPE_SNAPSHOT];
+        if (NULL != pChannel) {
+            QCameraStream *pStream = NULL;
+            for (uint32_t i = 0 ; i < pChannel->getNumOfStreams(); i++ ) {
+                pStream = pChannel->getStreamByIndex(i);
+                if ((NULL != pStream) &&
+                        (CAM_STREAM_TYPE_SNAPSHOT ==
+                        pStream->getMyType())) {
+                    break;
+                }
+            }
+            if (pStream != NULL) {
+                LOGD("REQUEST_FRAMES event for TNR snapshot");
+                cam_stream_parm_buffer_t param;
+                memset(&param, 0, sizeof(cam_stream_parm_buffer_t));
+                param.type = CAM_STREAM_PARAM_TYPE_REQUEST_FRAMES;
+                param.frameRequest.enableStream = 0;
+                rc = pStream->setParameter(param);
+                if (rc != NO_ERROR) {
+                    LOGE("Stream Event REQUEST_FRAMES failed");
+                }
+            }
+        }
     }
 
-    str = mParameters.flatten( );
-    strParams = (char *)malloc(sizeof(char)*(str.length()+1));
-    if(strParams != NULL){
-        memset(strParams, 0, sizeof(char)*(str.length()+1));
-        strlcpy(strParams, str.string(), str.length()+1);
-        strParams[str.length()] = 0;
-    }
-
-    if(mParameters.m_reprocScaleParam.isScaleEnabled() &&
-        mParameters.m_reprocScaleParam.isUnderScaling()){
-        //need set back picture size
-        String8 pic_size("");
-        char buffer[32];
-        snprintf(buffer, sizeof(buffer), "%dx%d", cur_width, cur_height);
-        pic_size.append(buffer);
-        mParameters.set(CameraParameters::KEY_PICTURE_SIZE, pic_size);
-    }
-    pthread_mutex_unlock(&m_parm_lock);
-    return strParams;
+    return rc;
 }
 
 /*===========================================================================
@@ -5223,7 +6393,7 @@ int QCamera2HardwareInterface::putParameters(char *parms)
  *              none-zero failure code
  *==========================================================================*/
 int QCamera2HardwareInterface::sendCommand(int32_t command,
-        int32_t &arg1, int32_t &arg2)
+        __unused int32_t &arg1, __unused int32_t &arg2)
 {
     int rc = NO_ERROR;
 
@@ -5234,11 +6404,9 @@ int QCamera2HardwareInterface::sendCommand(int32_t command,
         // Longshot can only be enabled when image capture
         // is not active.
         if ( !m_stateMachine.isCaptureRunning() ) {
-            CDBG_HIGH("%s: Longshot Enabled", __func__);
+            LOGI("Longshot Enabled");
             mLongshotEnabled = true;
-            pthread_mutex_lock(&m_parm_lock);
             rc = mParameters.setLongshotEnable(mLongshotEnabled);
-            pthread_mutex_unlock(&m_parm_lock);
 
             // Due to recent buffer count optimizations
             // ZSL might run with considerably less buffers
@@ -5293,17 +6461,15 @@ int QCamera2HardwareInterface::sendCommand(int32_t command,
             }
         }
         mPrepSnapRun = false;
-        CDBG_HIGH("%s: Longshot Disabled", __func__);
+        LOGI("Longshot Disabled");
         mLongshotEnabled = false;
-        pthread_mutex_lock(&m_parm_lock);
         rc = mParameters.setLongshotEnable(mLongshotEnabled);
-        pthread_mutex_unlock(&m_parm_lock);
         mCACDoneReceived = FALSE;
         break;
     case CAMERA_CMD_HISTOGRAM_ON:
     case CAMERA_CMD_HISTOGRAM_OFF:
         rc = setHistogram(command == CAMERA_CMD_HISTOGRAM_ON? true : false);
-        CDBG_HIGH("%s: Histogram -> %s", __func__,
+        LOGH("Histogram -> %s",
               mParameters.isHistogramEnabled() ? "Enabled" : "Disabled");
         break;
 #endif
@@ -5311,7 +6477,7 @@ int QCamera2HardwareInterface::sendCommand(int32_t command,
     case CAMERA_CMD_STOP_FACE_DETECTION:
         mParameters.setFaceDetectionOption(command == CAMERA_CMD_START_FACE_DETECTION? true : false);
         rc = setFaceDetection(command == CAMERA_CMD_START_FACE_DETECTION? true : false);
-        CDBG_HIGH("%s: FaceDetection -> %s", __func__,
+        LOGH("FaceDetection -> %s",
               mParameters.isFaceDetectionEnabled() ? "Enabled" : "Disabled");
         break;
 #ifndef VANILLA_HAL
@@ -5346,33 +6512,34 @@ int QCamera2HardwareInterface::registerFaceImage(void *img_ptr,
     faceID = -1;
 
     if (img_ptr == NULL || config == NULL) {
-        ALOGE("%s: img_ptr or config is NULL", __func__);
+        LOGE("img_ptr or config is NULL");
         return BAD_VALUE;
     }
 
     // allocate ion memory for source image
     QCameraHeapMemory *imgBuf = new QCameraHeapMemory(QCAMERA_ION_USE_CACHE);
     if (imgBuf == NULL) {
-        ALOGE("%s: Unable to new heap memory obj for image buf", __func__);
+        LOGE("Unable to new heap memory obj for image buf");
         return NO_MEMORY;
     }
 
-    rc = imgBuf->allocate(1, config->input_buf_planes.plane_info.frame_len, NON_SECURE);
+    rc = imgBuf->allocate(1, config->input_buf_planes.plane_info.frame_len);
     if (rc < 0) {
-        ALOGE("%s: Unable to allocate heap memory for image buf", __func__);
+        LOGE("Unable to allocate heap memory for image buf");
         delete imgBuf;
         return NO_MEMORY;
     }
 
     void *pBufPtr = imgBuf->getPtr(0);
     if (pBufPtr == NULL) {
-        ALOGE("%s: image buf is NULL", __func__);
+        LOGE("image buf is NULL");
         imgBuf->deallocate();
         delete imgBuf;
         return NO_MEMORY;
     }
     memcpy(pBufPtr, img_ptr, config->input_buf_planes.plane_info.frame_len);
-
+    //Do cache ops before sending for reprocess
+    imgBuf->cleanInvalidateCache(0);
     cam_pp_feature_config_t pp_feature;
     memset(&pp_feature, 0, sizeof(cam_pp_feature_config_t));
     pp_feature.feature_mask = CAM_QCOM_FEATURE_REGISTER_FACE;
@@ -5380,7 +6547,7 @@ int QCamera2HardwareInterface::registerFaceImage(void *img_ptr,
         addOfflineReprocChannel(*config, pp_feature, NULL, NULL);
 
     if (pChannel == NULL) {
-        ALOGE("%s: fail to add offline reprocess channel", __func__);
+        LOGE("fail to add offline reprocess channel");
         imgBuf->deallocate();
         delete imgBuf;
         return UNKNOWN_ERROR;
@@ -5388,7 +6555,7 @@ int QCamera2HardwareInterface::registerFaceImage(void *img_ptr,
 
     rc = pChannel->start();
     if (rc != NO_ERROR) {
-        ALOGE("%s: Cannot start reprocess channel", __func__);
+        LOGE("Cannot start reprocess channel");
         imgBuf->deallocate();
         delete imgBuf;
         delete pChannel;
@@ -5397,9 +6564,10 @@ int QCamera2HardwareInterface::registerFaceImage(void *img_ptr,
 
     ssize_t bufSize = imgBuf->getSize(0);
     if (BAD_INDEX != bufSize) {
-        rc = pChannel->doReprocess(imgBuf->getFd(0), (size_t)bufSize, faceID);
+        rc = pChannel->doReprocess(imgBuf->getFd(0), imgBuf->getPtr(0),
+                (size_t)bufSize, faceID);
     } else {
-        ALOGE("Failed to retrieve buffer size (bad index)");
+        LOGE("Failed to retrieve buffer size (bad index)");
         return UNKNOWN_ERROR;
     }
 
@@ -5461,9 +6629,7 @@ int QCamera2HardwareInterface::dump(int fd)
 
     /* send UPDATE_DEBUG_LEVEL to the backend so that they can read the
        debug level property */
-    pthread_mutex_lock(&m_parm_lock);
     mParameters.updateDebugLevel();
-    pthread_mutex_unlock(&m_parm_lock);
     return NO_ERROR;
 }
 
@@ -5590,7 +6756,7 @@ void QCamera2HardwareInterface::camEvtHandle(uint32_t /*camera_handle*/,
                     {
                         Mutex::Autolock l(obj->mDefLock);
                         obj->mDefCond.broadcast();
-                        CDBG_HIGH("%s: broadcast mDefCond signal\n", __func__);
+                        LOGH("broadcast mDefCond signal\n");
                     }
                     [[clang::fallthrough]];
                 default:
@@ -5599,7 +6765,7 @@ void QCamera2HardwareInterface::camEvtHandle(uint32_t /*camera_handle*/,
             }
         }
     } else {
-        ALOGE("%s: NULL user_data", __func__);
+        LOGE("NULL user_data");
     }
 }
 
@@ -5637,7 +6803,7 @@ void QCamera2HardwareInterface::jpegEvtHandle(jpeg_job_status_t status,
             obj->processEvt(QCAMERA_SM_EVT_JPEG_EVT_NOTIFY, payload);
         }
     } else {
-        ALOGE("%s: NULL user_data", __func__);
+        LOGE("NULL user_data");
     }
 }
 
@@ -5659,13 +6825,13 @@ int QCamera2HardwareInterface::thermalEvtHandle(
         qcamera_thermal_level_enum_t *level, void *userdata, void *data)
 {
     if (!mCameraOpened) {
-        CDBG_HIGH("%s: Camera is not opened, no need to handle thermal evt", __func__);
+        LOGH("Camera is not opened, no need to handle thermal evt");
         return NO_ERROR;
     }
 
     // Make sure thermal events are logged
-    CDBG_HIGH("%s: level = %d, userdata = %p, data = %p",
-        __func__, *level, userdata, data);
+    LOGH("level = %d, userdata = %p, data = %p",
+         *level, userdata, data);
     //We don't need to lockAPI, waitAPI here. QCAMERA_SM_EVT_THERMAL_NOTIFY
     // becomes an aync call. This also means we can only pass payload
     // by value, not by address.
@@ -5711,23 +6877,21 @@ int32_t QCamera2HardwareInterface::sendEvtNotify(int32_t msg_type,
  *==========================================================================*/
 int32_t QCamera2HardwareInterface::processAEInfo(cam_3a_params_t &ae_params)
 {
-    pthread_mutex_lock(&m_parm_lock);
     mParameters.updateAEInfo(ae_params);
     if (mParameters.isInstantAECEnabled()) {
         // Reset Instant AEC info only if instant aec enabled.
         bool bResetInstantAec = false;
-        if (ae_params.settled)
-        {
+        if (ae_params.settled) {
             // If AEC settled, reset instant AEC
             bResetInstantAec = true;
-        } else if (mParameters.isInstantCaptureEnabled() &&
-                mInstantAecFrameCount >= mParameters.getAecFrameBoundValue()) {
+        } else if ((mParameters.isInstantCaptureEnabled()) &&
+                (mInstantAecFrameCount >= mParameters.getAecFrameBoundValue())) {
             // if AEC not settled, and instant capture enabled,
             // reset instant AEC only when frame count is
             // more or equal to AEC frame bound value.
             bResetInstantAec = true;
-        } else if (mParameters.isInstantAECEnabled() &&
-                mInstantAecFrameCount >= mParameters.getAecSkipDisplayFrameBound()) {
+        } else if ((mParameters.isInstantAECEnabled()) &&
+                (mInstantAecFrameCount >= mParameters.getAecSkipDisplayFrameBound())) {
             // if AEC not settled, and only instant AEC enabled,
             // reset instant AEC only when frame count is
             // more or equal to AEC skip display frame bound value.
@@ -5735,12 +6899,11 @@ int32_t QCamera2HardwareInterface::processAEInfo(cam_3a_params_t &ae_params)
         }
 
         if (bResetInstantAec) {
-            CDBG("setting instant AEC to false");
+            LOGD("setting instant AEC to false");
             mParameters.setInstantAEC(false, true);
             mInstantAecFrameCount = 0;
         }
     }
-    pthread_mutex_unlock(&m_parm_lock);
     return NO_ERROR;
 }
 
@@ -5756,9 +6919,7 @@ int32_t QCamera2HardwareInterface::processAEInfo(cam_3a_params_t &ae_params)
  *==========================================================================*/
 int32_t QCamera2HardwareInterface::processFocusPositionInfo(cam_focus_pos_info_t &cur_pos_info)
 {
-    pthread_mutex_lock(&m_parm_lock);
     mParameters.updateCurrentFocusPosition(cur_pos_info);
-    pthread_mutex_unlock(&m_parm_lock);
     return NO_ERROR;
 }
 
@@ -5777,16 +6938,16 @@ int32_t QCamera2HardwareInterface::processFocusPositionInfo(cam_focus_pos_info_t
 int32_t QCamera2HardwareInterface::processAutoFocusEvent(cam_auto_focus_data_t &focus_data)
 {
     int32_t ret = NO_ERROR;
-    CDBG_HIGH("%s: E",__func__);
+    LOGH("E");
 
     if (getRelatedCamSyncInfo()->mode == CAM_MODE_SECONDARY) {
         // Ignore focus updates
-        CDBG_HIGH("%s: X Secondary Camera, no need to process!! ", __func__);
+        LOGH("X Secondary Camera, no need to process!! ");
         return ret;
     }
     cam_focus_mode_type focusMode = mParameters.getFocusMode();
-    CDBG_HIGH("[AF_DBG] %s: focusMode=%d, focusState=%d",
-            __func__, focusMode, focus_data.focus_state);
+    LOGH("[AF_DBG]  focusMode=%d, focusState=%d isDepth=%d mActiveAF=%d",
+             focusMode, focus_data.focus_state, focus_data.isDepth, mActiveAF);
 
     switch (focusMode) {
     case CAM_FOCUS_MODE_AUTO:
@@ -5818,24 +6979,23 @@ int32_t QCamera2HardwareInterface::processAutoFocusEvent(cam_auto_focus_data_t &
             break;
         }
         // update focus distance
-        pthread_mutex_lock(&m_parm_lock);
         mParameters.updateFocusDistances(&focus_data.focus_dist);
-        pthread_mutex_unlock(&m_parm_lock);
 
         //flush any old snapshot frames in ZSL Q which are not focused.
-        if ((CAM_AF_STATE_FOCUSED_LOCKED == focus_data.focus_state) &&
-                mParameters.isZSLMode()) {
+        if (mParameters.isZSLMode() && focus_data.flush_info.needFlush ) {
             QCameraPicChannel *pZSLChannel =
                     (QCameraPicChannel *)m_channels[QCAMERA_CH_TYPE_ZSL];
             if (NULL != pZSLChannel) {
                 //flush the zsl-buffer
-                uint32_t flush_frame_idx = focus_data.focused_frame_idx;
-                CDBG("%s, flush the zsl-buffer before frame = %u.", __func__, flush_frame_idx);
-                pZSLChannel->flushSuperbuffer(flush_frame_idx);
+                uint32_t flush_frame_idx = focus_data.flush_info.focused_frame_idx;
+                LOGD("flush the zsl-buffer for cam %d before frame = %u.",
+                        mActiveCameras, flush_frame_idx);
+                pZSLChannel->flushSuperbuffer(mActiveCameras, flush_frame_idx);
             }
         }
 
         //send event to app finally
+        LOGI("Send AF DOne event to app");
         ret = sendEvtNotify(CAMERA_MSG_FOCUS,
                             (focus_data.focus_state == CAM_AF_STATE_FOCUSED_LOCKED), 0);
         break;
@@ -5858,6 +7018,12 @@ int32_t QCamera2HardwareInterface::processAutoFocusEvent(cam_auto_focus_data_t &
             break;
         }
 
+        if (!bDepthAFCallbacks && focus_data.isDepth &&
+                (focus_data.focus_state == CAM_AF_STATE_PASSIVE_SCAN)) {
+            LOGD("Skip sending scan state to app, if depth focus");
+            break;
+        }
+
         //These are the AF states for which we need to send notification to app in CAF mode.
         //This includes both regular CAF (PASSIVE) events as well as ACTIVE events ( in case
         //AF is triggered while in CAF mode)
@@ -5867,23 +7033,23 @@ int32_t QCamera2HardwareInterface::processAutoFocusEvent(cam_auto_focus_data_t &
                 (focus_data.focus_state == CAM_AF_STATE_NOT_FOCUSED_LOCKED)) {
 
             // update focus distance
-            pthread_mutex_lock(&m_parm_lock);
             mParameters.updateFocusDistances(&focus_data.focus_dist);
-            pthread_mutex_unlock(&m_parm_lock);
 
-            if ((focusMode == CAM_FOCUS_MODE_CONTINOUS_PICTURE) &&
-                    (CAM_AF_STATE_FOCUSED_LOCKED == focus_data.focus_state) &&
-                    mParameters.isZSLMode()) {
+            if (mParameters.isZSLMode() && focus_data.flush_info.needFlush ) {
                 QCameraPicChannel *pZSLChannel =
                         (QCameraPicChannel *)m_channels[QCAMERA_CH_TYPE_ZSL];
                 if (NULL != pZSLChannel) {
                     //flush the zsl-buffer
-                    uint32_t flush_frame_idx = focus_data.focused_frame_idx;
-                    CDBG("%s, flush the zsl-buffer before frame = %u.", __func__, flush_frame_idx);
-                    pZSLChannel->flushSuperbuffer(flush_frame_idx);
+                    uint32_t flush_frame_idx = focus_data.flush_info.focused_frame_idx;
+                    LOGD("flush the zsl-buffer for cam %d before frame = %u.",
+                        mActiveCameras, flush_frame_idx);
+                    pZSLChannel->flushSuperbuffer(mActiveCameras, flush_frame_idx);
                 }
             }
 
+            if (mActiveAF) {
+                LOGI("Send AF Done event to app");
+            }
             ret = sendEvtNotify(CAMERA_MSG_FOCUS,
                     ((focus_data.focus_state == CAM_AF_STATE_PASSIVE_FOCUSED) ||
                     (focus_data.focus_state == CAM_AF_STATE_FOCUSED_LOCKED)), 0);
@@ -5895,7 +7061,7 @@ int32_t QCamera2HardwareInterface::processAutoFocusEvent(cam_auto_focus_data_t &
     case CAM_FOCUS_MODE_FIXED:
     case CAM_FOCUS_MODE_EDOF:
     default:
-        CDBG_HIGH("%s: no ops for autofocus event in focusmode %d", __func__, focusMode);
+        LOGH("no ops for autofocus event in focusmode %d", focusMode);
         break;
     }
 
@@ -5905,7 +7071,7 @@ int32_t QCamera2HardwareInterface::processAutoFocusEvent(cam_auto_focus_data_t &
         mActiveAF = false;
     }
 
-    CDBG_HIGH("%s: X",__func__);
+    LOGH("X");
     return ret;
 }
 
@@ -5948,11 +7114,10 @@ int32_t QCamera2HardwareInterface::processZSLCaptureDone()
 {
     int rc = NO_ERROR;
 
-    pthread_mutex_lock(&m_parm_lock);
-    if (++mInputCount >= mParameters.getBurstCountForAdvancedCapture()) {
+    if ((++mInputCount >= mParameters.getBurstCountForAdvancedCapture())
+            && !mParameters.getRawZsl()) {
         rc = unconfigureAdvancedCapture();
     }
-    pthread_mutex_unlock(&m_parm_lock);
 
     return rc;
 }
@@ -5972,23 +7137,19 @@ int32_t QCamera2HardwareInterface::processRetroAECUnlock()
 {
     int rc = NO_ERROR;
 
-    CDBG_HIGH("%s : [ZSL Retro] LED assisted AF Release AEC Lock", __func__);
-    pthread_mutex_lock(&m_parm_lock);
+    LOGH("LED assisted AF Release AEC Lock");
     rc = mParameters.setAecLock("false");
     if (NO_ERROR != rc) {
-        ALOGE("%s: Error setting AEC lock", __func__);
-        pthread_mutex_unlock(&m_parm_lock);
+        LOGE("Error setting AEC lock");
         return rc;
     }
 
     rc = mParameters.commitParameters();
     if (NO_ERROR != rc) {
-        ALOGE("%s: Error during camera parameter commit", __func__);
+        LOGE("Error during camera parameter commit");
     } else {
         m_bLedAfAecLock = FALSE;
     }
-
-    pthread_mutex_unlock(&m_parm_lock);
 
     return rc;
 }
@@ -6005,7 +7166,8 @@ int32_t QCamera2HardwareInterface::processRetroAECUnlock()
  *              NO_ERROR  -- success
  *              none-zero failure code
  *==========================================================================*/
-int32_t QCamera2HardwareInterface::processHDRData(cam_asd_hdr_scene_data_t hdr_scene)
+int32_t QCamera2HardwareInterface::processHDRData(
+        __unused cam_asd_hdr_scene_data_t hdr_scene)
 {
     int rc = NO_ERROR;
 
@@ -6017,9 +7179,7 @@ int32_t QCamera2HardwareInterface::processHDRData(cam_asd_hdr_scene_data_t hdr_s
     } else {
         m_HDRSceneEnabled = false;
     }
-    pthread_mutex_lock(&m_parm_lock);
     mParameters.setHDRSceneEnable(m_HDRSceneEnabled);
-    pthread_mutex_unlock(&m_parm_lock);
 
     if ( msgTypeEnabled(CAMERA_MSG_META_DATA) ) {
 
@@ -6032,14 +7192,13 @@ int32_t QCamera2HardwareInterface::processHDRData(cam_asd_hdr_scene_data_t hdr_s
                                                  1,
                                                  mCallbackCookie);
         if ( NULL == hdrBuffer ) {
-            ALOGE("%s: Not enough memory for auto HDR data",
-                  __func__);
+            LOGE("Not enough memory for auto HDR data");
             return NO_MEMORY;
         }
 
         int *pHDRData = (int *)hdrBuffer->data;
         if (pHDRData == NULL) {
-            ALOGE("%s: memory data ptr is NULL", __func__);
+            LOGE("memory data ptr is NULL");
             return UNKNOWN_ERROR;
         }
 
@@ -6057,13 +7216,12 @@ int32_t QCamera2HardwareInterface::processHDRData(cam_asd_hdr_scene_data_t hdr_s
         cbArg.release_cb = releaseCameraMemory;
         rc = m_cbNotifier.notifyCallback(cbArg);
         if (rc != NO_ERROR) {
-            ALOGE("%s: fail sending auto HDR notification", __func__);
+            LOGE("fail sending auto HDR notification");
             hdrBuffer->release(hdrBuffer);
         }
     }
 
-    CDBG_HIGH("%s : hdr_scene_data: processHDRData: %d %f",
-          __func__,
+    LOGH("hdr_scene_data: processHDRData: %d %f",
           hdr_scene.is_hdr_scene,
           hdr_scene.hdr_confidence);
 
@@ -6072,9 +7230,131 @@ int32_t QCamera2HardwareInterface::processHDRData(cam_asd_hdr_scene_data_t hdr_s
 }
 
 /*===========================================================================
+ * FUNCTION   : processLEDCalibration
+ *
+ * DESCRIPTION: process LED calibration result
+ *
+ * PARAMETERS :
+ *   @value : Calibaration result
+ *
+ * RETURN     : int32_t type of status
+ *              NO_ERROR  -- success
+ *              none-zero failure code
+ *==========================================================================*/
+int32_t QCamera2HardwareInterface::processLEDCalibration(int32_t value)
+{
+    int32_t rc = NO_ERROR;
+#ifndef VANILLA_HAL
+    if (mParameters.getDualLedCalibration()) {
+        LOGH("Dual LED calibration value = %d", value);
+        int32_t data_len = sizeof(value);
+        int32_t buffer_len = sizeof(int)       //meta type
+                + sizeof(int)                  //data len
+                + data_len;                    //data
+        camera_memory_t *buffer = mGetMemory(-1,
+                buffer_len, 1, mCallbackCookie);
+        if ( NULL == buffer ) {
+            LOGE("Not enough memory for data");
+            return NO_MEMORY;
+        }
+
+        int *pData = (int *)buffer->data;
+        if (pData == NULL) {
+            LOGE("memory data ptr is NULL");
+            buffer->release(buffer);
+            return UNKNOWN_ERROR;
+        }
+
+        pData[0] = QCAMERA_METADATA_LED_CALIB;
+        pData[1] = (int)data_len;
+        pData[2] = value;
+
+        qcamera_callback_argm_t cbArg;
+        memset(&cbArg, 0, sizeof(qcamera_callback_argm_t));
+        cbArg.cb_type = QCAMERA_DATA_CALLBACK;
+        cbArg.msg_type = CAMERA_MSG_META_DATA;
+        cbArg.data = buffer;
+        cbArg.user_data = buffer;
+        cbArg.cookie = this;
+        cbArg.release_cb = releaseCameraMemory;
+        int32_t rc = m_cbNotifier.notifyCallback(cbArg);
+        if (rc != NO_ERROR) {
+            LOGE("fail sending notification");
+            buffer->release(buffer);
+        }
+    }
+#else
+    (void)value;  // unused
+#endif
+    return rc;
+}
+
+/*===========================================================================
+ * FUNCTION   : processRTBData
+ *
+ * DESCRIPTION: process messages from RTB module
+ *
+ * PARAMETERS :
+ *   @rtbData : RTB metadata message
+ *
+ * RETURN     : int32_t type of status
+ *              NO_ERROR  -- success
+ *              none-zero failure code
+ *==========================================================================*/
+int32_t QCamera2HardwareInterface::processRTBData(cam_rtb_msg_type_t rtbData)
+{
+    int32_t rc = NO_ERROR;
+
+    //Check if we are in real time bokeh mode
+    if (isDualCamera() && (mParameters.getHalPPType() == CAM_HAL_PP_TYPE_BOKEH)) {
+        LOGH("DC RTB metadata: msgType: %d",rtbData);
+
+        mParameters.setBokehSnaphot(rtbData == CAM_RTB_MSG_DEPTH_EFFECT_SUCCESS);
+
+        int32_t data_len = sizeof(rtbData);
+        int32_t buffer_len = sizeof(rtbData)       //meta type
+                + sizeof(int)                  //data len
+                + data_len;                    //data
+        camera_memory_t *buffer = mGetMemory(-1,
+                buffer_len, 1, mCallbackCookie);
+        if ( NULL == buffer ) {
+            LOGE("Not enough memory for data");
+            return NO_MEMORY;
+        }
+
+        int *pData = (int *)buffer->data;
+        if (pData == NULL) {
+            LOGE("memory data ptr is NULL");
+            buffer->release(buffer);
+            return UNKNOWN_ERROR;
+        }
+
+        pData[0] = QCAMERA_METADATA_RTB;
+        pData[1] = (int)data_len;
+        pData[2] = rtbData;
+
+        qcamera_callback_argm_t cbArg;
+        memset(&cbArg, 0, sizeof(qcamera_callback_argm_t));
+        cbArg.cb_type = QCAMERA_DATA_CALLBACK;
+        cbArg.msg_type = CAMERA_MSG_META_DATA;
+        cbArg.data = buffer;
+        cbArg.user_data = buffer;
+        cbArg.cookie = this;
+        cbArg.release_cb = releaseCameraMemory;
+        int32_t rc = m_cbNotifier.notifyCallback(cbArg);
+        if (rc != NO_ERROR) {
+            LOGE("fail sending notification");
+            buffer->release(buffer);
+        }
+    }
+    return rc;
+}
+
+
+/*===========================================================================
  * FUNCTION   : transAwbMetaToParams
  *
- * DESCRIPTION: translate awb params from metadata callback to QCameraParameters
+ * DESCRIPTION: translate awb params from metadata callback to QCameraParametersIntf
  *
  * PARAMETERS :
  *   @awb_params : awb params from metadata callback
@@ -6085,9 +7365,7 @@ int32_t QCamera2HardwareInterface::processHDRData(cam_asd_hdr_scene_data_t hdr_s
  *==========================================================================*/
 int32_t QCamera2HardwareInterface::transAwbMetaToParams(cam_awb_params_t &awb_params)
 {
-    pthread_mutex_lock(&m_parm_lock);
     mParameters.updateAWBParams(awb_params);
-    pthread_mutex_unlock(&m_parm_lock);
     return NO_ERROR;
 }
 
@@ -6108,15 +7386,14 @@ int32_t QCamera2HardwareInterface::processPrepSnapshotDoneEvent(
                         cam_prep_snapshot_state_t prep_snapshot_state)
 {
     int32_t ret = NO_ERROR;
-
+    LOGI("[KPI Perf]: Received PREPARE SANSPHOT Done event state = %d",
+            prep_snapshot_state);
     if (m_channels[QCAMERA_CH_TYPE_ZSL] &&
         prep_snapshot_state == NEED_FUTURE_FRAME) {
-        CDBG_HIGH("%s: already handled in mm-camera-intf, no ops here", __func__);
+        LOGH("already handled in mm-camera-intf, no ops here");
         if (isRetroPicture()) {
-            pthread_mutex_lock(&m_parm_lock);
             mParameters.setAecLock("true");
             mParameters.commitParameters();
-            pthread_mutex_unlock(&m_parm_lock);
             m_bLedAfAecLock = TRUE;
         }
     }
@@ -6135,53 +7412,48 @@ int32_t QCamera2HardwareInterface::processPrepSnapshotDoneEvent(
  *              NO_ERROR  -- success
  *              none-zero failure code
  *==========================================================================*/
-int32_t QCamera2HardwareInterface::processASDUpdate(cam_auto_scene_t scene)
+int32_t QCamera2HardwareInterface::processASDUpdate(
+        __unused cam_asd_decision_t asd_decision)
 {
-    //set ASD parameter
-    pthread_mutex_lock(&m_parm_lock);
-    mParameters.set(QCameraParameters::KEY_SELECTED_AUTO_SCENE, mParameters.getASDStateString(scene));
-    pthread_mutex_unlock(&m_parm_lock);
-
-    size_t data_len = sizeof(cam_auto_scene_t);
-    size_t buffer_len = 1 *sizeof(int)       //meta type
-                      + 1 *sizeof(int)       //data len
-                      + data_len;            //data
-    camera_memory_t *asdBuffer = mGetMemory(-1,
-                                             buffer_len,
-                                             1,
-                                             mCallbackCookie);
-    if ( NULL == asdBuffer ) {
-        ALOGE("%s: Not enough memory for histogram data", __func__);
-        return NO_MEMORY;
-    }
-
-    int *pASDData = (int *)asdBuffer->data;
-    if (pASDData == NULL) {
-        ALOGE("%s: memory data ptr is NULL", __func__);
-        return UNKNOWN_ERROR;
-    }
-
 #ifndef VANILLA_HAL
-    pASDData[0] = CAMERA_META_DATA_ASD;
-    pASDData[1] = (int)data_len;
-    pASDData[2] = scene;
+    if ( msgTypeEnabled(CAMERA_MSG_META_DATA) ) {
+        size_t data_len = sizeof(cam_auto_scene_t);
+        size_t buffer_len = 1 *sizeof(int)       //meta type
+                + 1 *sizeof(int)       //data len
+                + data_len;            //data
+        camera_memory_t *asdBuffer = mGetMemory(-1,
+                buffer_len, 1, mCallbackCookie);
+        if ( NULL == asdBuffer ) {
+            LOGE("Not enough memory for histogram data");
+            return NO_MEMORY;
+        }
 
-    qcamera_callback_argm_t cbArg;
-    memset(&cbArg, 0, sizeof(qcamera_callback_argm_t));
-    cbArg.cb_type = QCAMERA_DATA_CALLBACK;
-    cbArg.msg_type = CAMERA_MSG_META_DATA;
-    cbArg.data = asdBuffer;
-    cbArg.user_data = asdBuffer;
-    cbArg.cookie = this;
-    cbArg.release_cb = releaseCameraMemory;
-    int32_t rc = m_cbNotifier.notifyCallback(cbArg);
-    if (rc != NO_ERROR) {
-        ALOGE("%s: fail sending notification", __func__);
-        asdBuffer->release(asdBuffer);
+        int *pASDData = (int *)asdBuffer->data;
+        if (pASDData == NULL) {
+            LOGE("memory data ptr is NULL");
+            return UNKNOWN_ERROR;
+        }
+
+        pASDData[0] = CAMERA_META_DATA_ASD;
+        pASDData[1] = (int)data_len;
+        pASDData[2] = asd_decision.detected_scene;
+
+        qcamera_callback_argm_t cbArg;
+        memset(&cbArg, 0, sizeof(qcamera_callback_argm_t));
+        cbArg.cb_type = QCAMERA_DATA_CALLBACK;
+        cbArg.msg_type = CAMERA_MSG_META_DATA;
+        cbArg.data = asdBuffer;
+        cbArg.user_data = asdBuffer;
+        cbArg.cookie = this;
+        cbArg.release_cb = releaseCameraMemory;
+        int32_t rc = m_cbNotifier.notifyCallback(cbArg);
+        if (rc != NO_ERROR) {
+            LOGE("fail sending notification");
+            asdBuffer->release(asdBuffer);
+        }
     }
 #endif
     return NO_ERROR;
-
 }
 
 /*===========================================================================
@@ -6199,6 +7471,220 @@ int32_t QCamera2HardwareInterface::processASDUpdate(cam_auto_scene_t scene)
 int32_t QCamera2HardwareInterface::processJpegNotify(qcamera_jpeg_evt_payload_t *jpeg_evt)
 {
     return m_postprocessor.processJpegEvt(jpeg_evt);
+}
+
+
+/*===========================================================================
+ * FUNCTION   : initDCSettings
+ *
+ * DESCRIPTION: initialize dual camera settings
+ *
+ * PARAMETERS : none
+ *
+ * RETURN     : none
+ *==========================================================================*/
+void QCamera2HardwareInterface::initDCSettings()
+{
+    fov_control_result_t fovControlResult;
+
+    if (!isDualCamera()) {
+        return;
+    }
+
+    fovControlResult = m_pFovControl->getFovControlResult();
+    if (fovControlResult.isValid) {
+        mActiveCameras = fovControlResult.activeCameras;
+        mMasterCamera = fovControlResult.camMasterPreview;
+        mBundledSnapshot = fovControlResult.snapshotPostProcess;
+        mFallbackMode = fovControlResult.fallback;
+
+        if (mBundledSnapshot && (!mParameters.needSnapshotPP() || mFlashNeeded)) {
+            mBundledSnapshot = false;
+            LOGD("Disable snapshot pp as one of unsupported feature is set");
+        }
+        mParameters.updateOisMode(fovControlResult.oisMode);
+    }
+    mParameters.initDCSettings(mActiveCameras, mMasterCamera, mBundledSnapshot, mFallbackMode);
+    LOGH("mActiveCameras = %d, mMasterCamera = %d bundledSnapshot = %d mFallbackMode = %d",
+            mActiveCameras, mMasterCamera, mBundledSnapshot, mFallbackMode);
+}
+
+/*===========================================================================
+ * FUNCTION   : updateDCSettings
+ *
+ * DESCRIPTION: update dual camera settings to channels and streams
+ *
+ * PARAMETERS : none
+ *
+ * RETURN     : none
+ *==========================================================================*/
+void QCamera2HardwareInterface::updateDCSettings()
+{
+    //Update camera status to internal channel
+    for (int i = 0; i < QCAMERA_CH_TYPE_MAX; i++) {
+        if (m_channels[i] != NULL && m_channels[i]->isDualChannel()) {
+            m_channels[i]->initDCSettings(mActiveCameras, mMasterCamera, mBundledSnapshot);
+        }
+    }
+}
+
+/*===========================================================================
+ * FUNCTION   : processDualCamFovControl
+ *
+ * DESCRIPTION: Based on the result collected from FOV control-
+ *              1. Switch the master camera if needed
+ *              2. Toggle the Low Power Mode for slave camera
+ *
+ * PARAMETERS : none
+ *
+ * RETURN     : none
+ *==========================================================================*/
+void QCamera2HardwareInterface::processDualCamFovControl()
+{
+   uint32_t activeCameras;
+   bool bundledSnapshot;
+   fov_control_result_t fovControlResult;
+   cam_fallback_mode_t fallbackMode;
+
+    if (!isDualCamera() || !m_bFirstPreviewFrameReceived) {
+        LOGD("Ignore DC process isDualCamera: %d, m_bFirstPreviewFrameReceived %d",
+                isDualCamera(), m_bFirstPreviewFrameReceived)
+        return;
+    }
+
+    fovControlResult = m_pFovControl->getFovControlResult();
+
+    if (fovControlResult.isValid) {
+        activeCameras = fovControlResult.activeCameras;
+        bundledSnapshot = fovControlResult.snapshotPostProcess;
+        fallbackMode = fovControlResult.fallback;
+
+        if (bundledSnapshot && (!mParameters.needSnapshotPP() || mFlashNeeded)) {
+            bundledSnapshot = false;
+            LOGD("Disable snapshot pp as one of unsupported feature is set");
+        }
+
+        processCameraControl(activeCameras, bundledSnapshot, fallbackMode);
+        switchCameraCb(fovControlResult.camMasterPreview);
+
+        // Update OIS mode based on the value in FOV-control result
+        mParameters.updateOisMode(fovControlResult.oisMode);
+    }
+}
+
+/*===========================================================================
+ * FUNCTION   : processCameraControl
+ *
+ * DESCRIPTION: Suspend and resume camera
+ *
+ * PARAMETERS :
+ *
+ * RETURN     : int32_t type of status
+ *              NO_ERROR  -- success
+ *              none-zero failure code
+ *==========================================================================*/
+int32_t QCamera2HardwareInterface::processCameraControl(
+        uint32_t activeCameras,
+        bool     bundledSnapshot,
+        cam_fallback_mode_t fallbackMode)
+{
+    int32_t ret = NO_ERROR;
+
+    //Update camera status to internal channel
+    for (int i = 0; i < QCAMERA_CH_TYPE_MAX; i++) {
+        if (m_channels[i] != NULL && m_channels[i]->isDualChannel()) {
+            ret = m_channels[i]->processCameraControl(activeCameras, bundledSnapshot);
+            if (ret != NO_ERROR) {
+                LOGE("Channel Switch Failed");
+                break;
+            }
+        }
+    }
+
+    //Set camera controls to parameter and back-end
+    ret = mParameters.setCameraControls(activeCameras, bundledSnapshot, fallbackMode);
+
+    if ((activeCameras != mActiveCameras) && (activeCameras == MM_CAMERA_DUAL_CAM)) {
+        // Flush the ZSL buffer queue for the camera that's put into LPM
+        QCameraPicChannel *pZSLChannel =
+                (QCameraPicChannel *)m_channels[QCAMERA_CH_TYPE_ZSL];
+        if (NULL != pZSLChannel) {
+            if (mActiveCameras == MM_CAMERA_TYPE_MAIN) {
+                // Flush ZSL buffer queue for the aux camera
+                pZSLChannel->flushSuperbuffer(MM_CAMERA_TYPE_AUX, 0);
+            } else {
+                // Flush ZSL buffer queue for the main camera
+                pZSLChannel->flushSuperbuffer(MM_CAMERA_TYPE_MAIN, 0);
+            }
+        }
+    }
+
+    LOGH("mActiveCameras = %d to %d, bundledSnapshot = %d to %d, fallback = %d to %d",
+            mActiveCameras, activeCameras, mBundledSnapshot, bundledSnapshot,
+            mFallbackMode, fallbackMode);
+    mActiveCameras   = activeCameras;
+    mBundledSnapshot = bundledSnapshot;
+    mFallbackMode    = fallbackMode;
+
+    return ret;
+}
+
+/*===========================================================================
+ * FUNCTION   : switchCameraCb
+ *
+ * DESCRIPTION: switch camera's in case of dual camera
+ *
+ * PARAMETERS :
+ * @camMaster : Master camera
+ *
+ * RETURN     : int32_t type of status
+ *              NO_ERROR  -- success
+ *              none-zero failure code
+ *==========================================================================*/
+int32_t QCamera2HardwareInterface::switchCameraCb(uint32_t camMaster)
+{
+    int32_t ret = NO_ERROR;
+
+    if (mActiveCameras & camMaster) {
+        for (int i = 0; i < QCAMERA_CH_TYPE_MAX; i++) {
+            if (m_channels[i] != NULL && m_channels[i]->isDualChannel()) {
+                ret = m_channels[i]->switchChannelCb(camMaster);
+                if (ret != NO_ERROR) {
+                    LOGE("Channel Switch Failed");
+                    break;
+                }
+            }
+        }
+        if (mMasterCamera != camMaster) {
+            if (ret == NO_ERROR) {
+                //Trigger Event to modules to update Master info
+                mParameters.setSwitchCamera(camMaster);
+                setDisplayFrameSkip();
+            }
+        }
+        // Update master camera
+        mMasterCamera = camMaster;
+    }
+
+    return ret;
+}
+
+/*===========================================================================
+ * FUNCTION   : forceCameraWakeup
+ *
+ * DESCRIPTION: Force the two cameras to stream.
+ *
+ * PARAMETERS : None
+ *
+ * RETURN     : None
+ *==========================================================================*/
+void QCamera2HardwareInterface::forceCameraWakeup()
+{
+    bool enable = true;
+    m_pFovControl->UpdateFlag(FOVCONTROL_FLAG_FORCE_CAMERA_WAKEUP, &enable);
+    processDualCamFovControl();
+    enable = false;
+    m_pFovControl->UpdateFlag(FOVCONTROL_FLAG_FORCE_CAMERA_WAKEUP, &enable);
 }
 
 /*===========================================================================
@@ -6227,12 +7713,46 @@ void QCamera2HardwareInterface::lockAPI()
  * RETURN     : none
  *==========================================================================*/
 void QCamera2HardwareInterface::waitAPIResult(qcamera_sm_evt_enum_t api_evt,
-        qcamera_api_result_t *apiResult)
+        qcamera_api_result_t *apiResult, int timeoutSec)
 {
-    CDBG("%s: wait for API result of evt (%d)", __func__, api_evt);
+    LOGD("wait for API result of evt (%d)", api_evt);
     int resultReceived = 0;
+    int32_t rc = NO_ERROR;
+    struct timespec ts_start;
+
+    if (timeoutSec != -1) {
+        rc = clock_gettime(CLOCK_MONOTONIC, &ts_start);
+        if (rc < 0) {
+            LOGE("Error reading the real time clock!!");
+            timeoutSec = -1;
+        }
+    }
+
     while  (!resultReceived) {
-        pthread_cond_wait(&m_cond, &m_lock);
+        if (timeoutSec == -1) {
+            pthread_cond_wait(&m_cond, &m_lock);
+        } else {
+            struct timespec ts_now;
+            rc = clock_gettime(CLOCK_MONOTONIC, &ts_now);
+            if (rc < 0) {
+                LOGE("Error reading the real time clock!!");
+                timeoutSec = -1;
+                continue;
+            }
+            int elapsed = ts_now.tv_sec - ts_start.tv_sec;
+            if (timeoutSec > elapsed) {
+                ts_now.tv_sec += (timeoutSec - elapsed);
+                rc = pthread_cond_timedwait(&m_cond, &m_lock, &ts_now);
+            } else {
+                rc = ETIMEDOUT;
+            }
+
+            if (rc == ETIMEDOUT) {
+                apiResult->status = rc;
+                LOGE("Timed out waiting for API (%d) result", api_evt);
+                break;
+            }
+        }
         if (m_apiResultList != NULL) {
             api_result_list *apiResultList = m_apiResultList;
             api_result_list *apiResultListPrevious = m_apiResultList;
@@ -6254,8 +7774,8 @@ void QCamera2HardwareInterface::waitAPIResult(qcamera_sm_evt_enum_t api_evt,
             }
         }
     }
-    CDBG("%s: return (%d) from API result wait for evt (%d)",
-          __func__, apiResult->status, api_evt);
+    LOGD("return (%d) from API result wait for evt (%d)",
+           apiResult->status, api_evt);
 }
 
 
@@ -6289,8 +7809,7 @@ void QCamera2HardwareInterface::signalAPIResult(qcamera_api_result_t *result)
     pthread_mutex_lock(&m_lock);
     api_result_list *apiResult = (api_result_list *)malloc(sizeof(api_result_list));
     if (apiResult == NULL) {
-        ALOGE("%s: ERROR: malloc for api result failed", __func__);
-        ALOGE("%s: ERROR: api thread will wait forever fot this lost result", __func__);
+        LOGE("ERROR: malloc for api result failed, Result will not be sent");
         goto malloc_failed;
     }
     apiResult->result = *result;
@@ -6339,7 +7858,8 @@ int32_t QCamera2HardwareInterface::prepareRawStream(QCameraChannel *curChannel)
             for (uint8_t i = 0; i < pChannel->getNumOfStreams(); i++) {
                 QCameraStream *pStream = pChannel->getStreamByIndex(i);
                 if (pStream != NULL) {
-                    if (pStream->isTypeOf(CAM_STREAM_TYPE_METADATA)) {
+                    if ((pStream->isTypeOf(CAM_STREAM_TYPE_METADATA))
+                            || (pStream->isTypeOf(CAM_STREAM_TYPE_POSTVIEW))) {
                         continue;
                     }
                     pStream->getFrameDimension(str_dim);
@@ -6357,7 +7877,8 @@ int32_t QCamera2HardwareInterface::prepareRawStream(QCameraChannel *curChannel)
     for (uint8_t i = 0; i < curChannel->getNumOfStreams(); i++) {
         QCameraStream *pStream = curChannel->getStreamByIndex(i);
         if (pStream != NULL) {
-            if (pStream->isTypeOf(CAM_STREAM_TYPE_METADATA)) {
+            if ((pStream->isTypeOf(CAM_STREAM_TYPE_METADATA))
+                    || (pStream->isTypeOf(CAM_STREAM_TYPE_POSTVIEW))) {
                 continue;
             }
             pStream->getFrameDimension(str_dim);
@@ -6369,11 +7890,62 @@ int32_t QCamera2HardwareInterface::prepareRawStream(QCameraChannel *curChannel)
             }
         }
     }
-    pthread_mutex_lock(&m_parm_lock);
     rc = mParameters.updateRAW(max_dim);
-    pthread_mutex_unlock(&m_parm_lock);
     return rc;
 }
+
+/*===========================================================================
+ * FUNCTION   : getPaddingInfo
+ *
+ * DESCRIPTION: calculate padding per stream
+ *
+ * PARAMETERS :
+ *   @streamType  : type of stream to be added
+ *   @padding_info : Padding info. Output
+ *
+ * RETURN     : int32_t type of status
+ *              NO_ERROR  -- success
+ *              none-zero failure code
+ *==========================================================================*/
+int32_t QCamera2HardwareInterface::getPaddingInfo(cam_stream_type_t streamType,
+        cam_padding_info_t *padding_info)
+{
+    int32_t rc = NO_ERROR;
+    if (streamType == CAM_STREAM_TYPE_ANALYSIS) {
+        cam_analysis_info_t analysisInfo;
+        cam_feature_mask_t featureMask;
+
+        featureMask = 0;
+        mParameters.getStreamPpMask(CAM_STREAM_TYPE_ANALYSIS, featureMask);
+        rc = mParameters.getAnalysisInfo(
+                ((mParameters.getRecordingHintValue() == true) &&
+                 mParameters.fdModeInVideo()),
+                featureMask,
+                &analysisInfo);
+        if (rc != NO_ERROR) {
+            LOGE("getAnalysisInfo failed, ret = %d", rc);
+            return rc;
+        }
+
+        *padding_info = analysisInfo.analysis_padding_info;
+    } else {
+        *padding_info =
+                gCamCapability[mCameraId]->padding_info;
+        if (streamType == CAM_STREAM_TYPE_PREVIEW || streamType == CAM_STREAM_TYPE_POSTVIEW ||
+            (isSecureMode() && isRdiMode())) {
+            padding_info->width_padding = mSurfaceStridePadding;
+            padding_info->height_padding = CAM_PAD_TO_2;
+        }
+        if((!needReprocess())
+                || (streamType != CAM_STREAM_TYPE_SNAPSHOT)
+                || (!mParameters.isLLNoiseEnabled())) {
+            padding_info->offset_info.offset_x = 0;
+            padding_info->offset_info.offset_y = 0;
+        }
+    }
+    return rc;
+}
+
 /*===========================================================================
  * FUNCTION   : addStreamToChannel
  *
@@ -6395,49 +7967,96 @@ int32_t QCamera2HardwareInterface::addStreamToChannel(QCameraChannel *pChannel,
                                                       void *userData)
 {
     int32_t rc = NO_ERROR;
-
+    QCameraHeapMemory *pStreamInfo = NULL;
+    uint32_t cam_type = MM_CAMERA_TYPE_MAIN;
+    bool needAuxStream = FALSE;
+    stream_cb_routine main_cb = streamCB;
+    stream_cb_routine aux_cb = streamCB;
     if (streamType == CAM_STREAM_TYPE_RAW) {
         prepareRawStream(pChannel);
     }
-    QCameraHeapMemory *pStreamInfo = allocateStreamInfoBuf(streamType);
+
+    if (isDualCamera()) {
+        if ((mParameters.isDCmAsymmetricSnapMode() &&
+                (streamType == CAM_STREAM_TYPE_SNAPSHOT)) ||
+                (mParameters.isDCAsymmetricPrevMode() &&
+                (streamType == CAM_STREAM_TYPE_PREVIEW))) {
+            // Need to add streams seperately for asymmetric modes
+            needAuxStream = TRUE;
+            LOGH("Asymm Mode : cam_type: 0x%x stream_type: %d",
+                    cam_type, streamType);
+        } else if ((mParameters.getHalPPType() != CAM_HAL_PP_TYPE_CLEARSIGHT) ||
+                (streamType != CAM_STREAM_TYPE_PREVIEW)) {
+            cam_type |= MM_CAMERA_TYPE_AUX;
+        }
+        if ((streamType == CAM_STREAM_TYPE_PREVIEW) &&
+                (mParameters.getHalPPType() == CAM_HAL_PP_TYPE_BOKEH)) {
+            if (isNoDisplayMode(MM_CAMERA_TYPE_MAIN)) {
+                main_cb = NULL;
+                LOGH("main_cb NULL : cam_type: 0x%x stream_type: %d",
+                        cam_type, streamType);
+            }
+            if (isNoDisplayMode(MM_CAMERA_TYPE_AUX)) {
+                LOGH("aux_cb NULL : cam_type: 0x%x stream_type: %d",
+                        cam_type, streamType);
+                aux_cb = NULL;
+            }
+        }
+    }
+
+    if ((streamType == CAM_STREAM_TYPE_ANALYSIS) &&
+            !mParameters.needAnalysisStream()) {
+        if (isDualCamera()) {
+            cam_type = MM_CAMERA_TYPE_MAIN;
+        } else {
+            return NO_ERROR;
+        }
+    }
+
+    pStreamInfo = allocateStreamInfoBuf(streamType,
+            getStreamRefCount(streamType, cam_type), cam_type);
     if (pStreamInfo == NULL) {
-        ALOGE("%s: no mem for stream info buf", __func__);
+        LOGE("no mem for stream info buf");
         return NO_MEMORY;
     }
-    uint8_t minStreamBufNum = getBufNumRequired(streamType);
+
     bool bDynAllocBuf = false;
     if (isZSLMode() && streamType == CAM_STREAM_TYPE_SNAPSHOT) {
         bDynAllocBuf = true;
     }
 
-    cam_padding_info_t *padding_info = NULL;
-
-    if (streamType == CAM_STREAM_TYPE_ANALYSIS) {
-        padding_info =
-                &gCamCapability[mCameraId]->analysis_padding_info;
-    } else {
-        padding_info =
-                &gCamCapability[mCameraId]->padding_info;
-    }
+    cam_padding_info_t padding_info;
+    getPaddingInfo(streamType, &padding_info);
 
     bool deferAllocation = needDeferred(streamType);
-    CDBG("%s: deferAllocation = %d bDynAllocBuf = %d, stream type = %d",__func__,
+    LOGD("deferAllocation = %d bDynAllocBuf = %d, stream type = %d",
             deferAllocation, bDynAllocBuf, streamType);
-    rc = pChannel->addStream(*this,
-            pStreamInfo,
-            NULL,
-            minStreamBufNum,
-            padding_info,
-            streamCB, userData,
-            bDynAllocBuf,
-            deferAllocation);
-
+    rc = pChannel->addStream(*this, pStreamInfo, NULL, &padding_info,
+            main_cb, userData, bDynAllocBuf,
+            deferAllocation, ROTATE_0, cam_type);
     if (rc != NO_ERROR) {
-        ALOGE("%s: add stream type (%d) failed, ret = %d",
-              __func__, streamType, rc);
+        LOGE("add stream type (%d) cam = %d failed, ret = %d",
+               streamType, cam_type, rc);
         return rc;
     }
 
+    /*Add stream for Asymmetric dual camera use case*/
+    if (needAuxStream) {
+        cam_type = MM_CAMERA_TYPE_AUX;
+        pStreamInfo = allocateStreamInfoBuf(streamType,
+                getStreamRefCount(streamType, cam_type), cam_type);
+        if (pStreamInfo == NULL) {
+            LOGE("no mem for stream info buf");
+            return NO_MEMORY;
+        }
+        rc = pChannel->addStream(*this, pStreamInfo, NULL, &padding_info,
+                aux_cb, userData, bDynAllocBuf, deferAllocation, ROTATE_0, cam_type);
+        if (rc != NO_ERROR) {
+            LOGE("add stream type (%d) cam = %d failed, ret = %d",
+                   streamType, cam_type, rc);
+            return rc;
+        }
+    }
     return rc;
 }
 
@@ -6466,72 +8085,100 @@ int32_t QCamera2HardwareInterface::addPreviewChannel()
         m_channels[QCAMERA_CH_TYPE_PREVIEW] = NULL;
     }
 
-    pChannel = new QCameraChannel(mCameraHandle->camera_handle,
-                                  mCameraHandle->ops);
+    uint32_t handle = getCamHandleForChannel(QCAMERA_CH_TYPE_PREVIEW);
+    pChannel = new QCameraChannel(handle, mCameraHandle->ops);
     if (NULL == pChannel) {
-        ALOGE("%s: no mem for preview channel", __func__);
+        LOGE("no mem for preview channel");
         return NO_MEMORY;
     }
 
     // preview only channel, don't need bundle attr and cb
     rc = pChannel->init(NULL, NULL, NULL);
     if (rc != NO_ERROR) {
-        ALOGE("%s: init preview channel failed, ret = %d", __func__, rc);
+        LOGE("init preview channel failed, ret = %d", rc);
+        delete pChannel;
         return rc;
     }
 
     // meta data stream always coexists with preview if applicable
     rc = addStreamToChannel(pChannel, CAM_STREAM_TYPE_METADATA,
-                            metadata_stream_cb_routine, this);
+            metadata_stream_cb_routine, this);
     if (rc != NO_ERROR) {
-        ALOGE("%s: add metadata stream failed, ret = %d", __func__, rc);
+        LOGE("add metadata stream failed, ret = %d", rc);
+        delete pChannel;
         return rc;
     }
-    /* For Mono Sensor as we are not linking the pproc analysis stream
-       will not be supported */
-    if (((mParameters.getDcrf() == true)
-            || (mParameters.getRecordingHintValue() != true)
-            || (mParameters.isFDInVideoEnabled()))
-            && (!mParameters.isSecureMode()) &&
-            (getSensorType() != CAM_SENSOR_Y)) {
+
+    if (isRdiMode()) {
+        if (isSecureMode()) {
+            LOGI("RDI - secure CB");
+            rc = addStreamToChannel(pChannel, CAM_STREAM_TYPE_RAW,
+                    secure_stream_cb_routine, this);
+        }
+        else {
+            LOGI("RDI - rdi CB");
+            rc = addStreamToChannel(pChannel, CAM_STREAM_TYPE_RAW,
+                    rdi_mode_stream_cb_routine, this);
+        }
+    } else {
+        if (isSecureMode()) {
+            LOGI("PREVIEW - secure CB");
+            rc = addStreamToChannel(pChannel, CAM_STREAM_TYPE_PREVIEW,
+                    secure_stream_cb_routine, this);
+        }
+        else {
+            LOGI("PREVIEW - non-secure CB");
+            uint32_t cam_type = CAM_TYPE_MAIN;
+            if (isDualCamera()) {
+                cam_type = (CAM_TYPE_MAIN | CAM_TYPE_AUX);
+            }
+            if (isNoDisplayMode(cam_type)) {
+                rc = addStreamToChannel(pChannel, CAM_STREAM_TYPE_PREVIEW,
+                        nodisplay_preview_stream_cb_routine, this);
+            } else {
+                    rc = addStreamToChannel(pChannel, CAM_STREAM_TYPE_PREVIEW,
+                            preview_stream_cb_routine, this);
+                    if (needSyncCB(CAM_STREAM_TYPE_PREVIEW) == TRUE) {
+                        pChannel->setStreamSyncCB(CAM_STREAM_TYPE_PREVIEW,
+                                synchronous_stream_cb_routine);
+                    }
+            }
+        }
+    }
+
+    if (rc != NO_ERROR) {
+        LOGE("add raw/preview stream failed, ret = %d", rc);
+        delete pChannel;
+        return rc;
+    }
+
+    if (((mParameters.fdModeInVideo())
+            || (mParameters.getDcrf() == true)
+            || (mParameters.getRecordingHintValue() != true))
+            && (!isSecureMode())) {
         rc = addStreamToChannel(pChannel, CAM_STREAM_TYPE_ANALYSIS,
                 NULL, this);
         if (rc != NO_ERROR) {
-            ALOGE("%s: add Analysis stream failed, ret = %d", __func__, rc);
+            LOGE("add Analysis stream failed, ret = %d", rc);
+            delete pChannel;
             return rc;
         }
     }
 
-    if (isRdiMode()) {
-        CDBG_HIGH("RDI_DEBUG %s[%d]: Add stream to channel", __func__, __LINE__);
-        rc = addStreamToChannel(pChannel, CAM_STREAM_TYPE_RAW,
-                                rdi_mode_stream_cb_routine, this);
-    } else {
-        if (isNoDisplayMode()) {
-            rc = addStreamToChannel(pChannel, CAM_STREAM_TYPE_PREVIEW,
-                                    nodisplay_preview_stream_cb_routine, this);
-        } else {
-            rc = addStreamToChannel(pChannel, CAM_STREAM_TYPE_PREVIEW,
-                                    preview_stream_cb_routine, this);
-            pChannel->setStreamSyncCB(CAM_STREAM_TYPE_PREVIEW,
-                    synchronous_stream_cb_routine);
-        }
-    }
-
-    property_get("persist.camera.raw_yuv", value, "0");
+    property_get("persist.vendor.camera.raw_yuv", value, "0");
     raw_yuv = atoi(value) > 0 ? true : false;
     if ( raw_yuv ) {
         rc = addStreamToChannel(pChannel,CAM_STREAM_TYPE_RAW,
                 preview_raw_stream_cb_routine,this);
         if ( rc != NO_ERROR ) {
-            ALOGE("%s: add raw stream failed, ret = %d", __FUNCTION__, rc);
+            LOGE("add raw stream failed, ret = %d", __FUNCTION__, rc);
             delete pChannel;
             return rc;
         }
     }
 
     if (rc != NO_ERROR) {
-        ALOGE("%s: add preview stream failed, ret = %d", __func__, rc);
+        LOGE("add preview stream failed, ret = %d", rc);
         delete pChannel;
         return rc;
     }
@@ -6562,10 +8209,10 @@ int32_t QCamera2HardwareInterface::addVideoChannel()
         m_channels[QCAMERA_CH_TYPE_VIDEO] = NULL;
     }
 
-    pChannel = new QCameraVideoChannel(mCameraHandle->camera_handle,
-                                       mCameraHandle->ops);
+    uint32_t handle = getCamHandleForChannel(QCAMERA_CH_TYPE_VIDEO);
+    pChannel = new QCameraVideoChannel(handle, mCameraHandle->ops);
     if (NULL == pChannel) {
-        ALOGE("%s: no mem for video channel", __func__);
+        LOGE("no mem for video channel");
         return NO_MEMORY;
     }
 
@@ -6576,7 +8223,8 @@ int32_t QCamera2HardwareInterface::addVideoChannel()
         attr.look_back = 0; //wait for future frame for liveshot
         attr.post_frame_skip = mParameters.getZSLBurstInterval();
         attr.water_mark = 1; //hold min buffers possible in Q
-        attr.max_unmatched_frames = mParameters.getMaxUnmatchedFramesInQueue();
+        attr.max_unmatched_frames = mParameters.getMaxUnmatchedFramesInQueue()
+                + mParameters.getNumOfExtraEISBufsIfNeeded();
         rc = pChannel->init(&attr, snapshot_channel_cb_routine, this);
     } else {
         // preview only channel, don't need bundle attr and cb
@@ -6584,15 +8232,16 @@ int32_t QCamera2HardwareInterface::addVideoChannel()
     }
 
     if (rc != 0) {
-        ALOGE("%s: init video channel failed, ret = %d", __func__, rc);
+        LOGE("init video channel failed, ret = %d", rc);
         delete pChannel;
         return rc;
     }
 
     rc = addStreamToChannel(pChannel, CAM_STREAM_TYPE_VIDEO,
-                            video_stream_cb_routine, this);
+            video_stream_cb_routine, this);
+
     if (rc != NO_ERROR) {
-        ALOGE("%s: add video stream failed, ret = %d", __func__, rc);
+        LOGE("add video stream failed, ret = %d", rc);
         delete pChannel;
         return rc;
     }
@@ -6625,24 +8274,24 @@ int32_t QCamera2HardwareInterface::addSnapshotChannel()
         m_channels[QCAMERA_CH_TYPE_SNAPSHOT] = NULL;
     }
 
-    pChannel = new QCameraChannel(mCameraHandle->camera_handle,
-                                  mCameraHandle->ops);
+    uint32_t handle = getCamHandleForChannel(QCAMERA_CH_TYPE_SNAPSHOT);
+    pChannel = new QCameraChannel(handle, mCameraHandle->ops);
     if (NULL == pChannel) {
-        ALOGE("%s: no mem for snapshot channel", __func__);
+        LOGE("no mem for snapshot channel");
         return NO_MEMORY;
     }
 
     mm_camera_channel_attr_t attr;
     memset(&attr, 0, sizeof(mm_camera_channel_attr_t));
     attr.notify_mode = MM_CAMERA_SUPER_BUF_NOTIFY_CONTINUOUS;
-    attr.look_back = mParameters.getZSLBackLookCount();
+    attr.look_back = 0; //wait for future frame for liveshot
     attr.post_frame_skip = mParameters.getZSLBurstInterval();
-    attr.water_mark = mParameters.getZSLQueueDepth();
+    attr.water_mark = 1; //hold min buffers possible in Q
     attr.max_unmatched_frames = mParameters.getMaxUnmatchedFramesInQueue();
     attr.priority = MM_CAMERA_SUPER_BUF_PRIORITY_LOW;
     rc = pChannel->init(&attr, snapshot_channel_cb_routine, this);
     if (rc != NO_ERROR) {
-        ALOGE("%s: init snapshot channel failed, ret = %d", __func__, rc);
+        LOGE("init snapshot channel failed, ret = %d", rc);
         delete pChannel;
         return rc;
     }
@@ -6650,7 +8299,7 @@ int32_t QCamera2HardwareInterface::addSnapshotChannel()
     rc = addStreamToChannel(pChannel, CAM_STREAM_TYPE_SNAPSHOT,
             NULL, NULL);
     if (rc != NO_ERROR) {
-        ALOGE("%s: add snapshot stream failed, ret = %d", __func__, rc);
+        LOGE("add snapshot stream failed, ret = %d", rc);
         delete pChannel;
         return rc;
     }
@@ -6681,33 +8330,59 @@ int32_t QCamera2HardwareInterface::addRawChannel()
         m_channels[QCAMERA_CH_TYPE_RAW] = NULL;
     }
 
-    pChannel = new QCameraChannel(mCameraHandle->camera_handle,
-                                  mCameraHandle->ops);
+    uint32_t handle = getCamHandleForChannel(QCAMERA_CH_TYPE_RAW);
+    pChannel = new QCameraChannel(handle, mCameraHandle->ops);
     if (NULL == pChannel) {
-        ALOGE("%s: no mem for raw channel", __func__);
+        LOGE("no mem for raw channel");
         return NO_MEMORY;
     }
 
-    rc = pChannel->init(NULL, NULL, NULL);
-    if (rc != NO_ERROR) {
-        ALOGE("%s: init raw channel failed, ret = %d", __func__, rc);
-        delete pChannel;
-        return rc;
+    if (mParameters.getofflineRAW()) {
+        mm_camera_channel_attr_t attr;
+        memset(&attr, 0, sizeof(mm_camera_channel_attr_t));
+        attr.notify_mode = MM_CAMERA_SUPER_BUF_NOTIFY_BURST;
+        attr.look_back = mParameters.getZSLBackLookCount();
+        attr.post_frame_skip = mParameters.getZSLBurstInterval();
+        attr.water_mark = 1;
+        attr.max_unmatched_frames = mParameters.getMaxUnmatchedFramesInQueue();
+        rc = pChannel->init(&attr, raw_channel_cb_routine, this);
+        if (rc != NO_ERROR) {
+            LOGE("init RAW channel failed, ret = %d", rc);
+            delete pChannel;
+            return rc;
+        }
+    } else {
+        rc = pChannel->init(NULL, NULL, NULL);
+        if (rc != NO_ERROR) {
+            LOGE("init raw channel failed, ret = %d", rc);
+            delete pChannel;
+            return rc;
+        }
     }
 
-    // meta data stream always coexists with snapshot in regular RAW capture case
-    rc = addStreamToChannel(pChannel, CAM_STREAM_TYPE_METADATA,
-                            metadata_stream_cb_routine, this);
-    if (rc != NO_ERROR) {
-        ALOGE("%s: add metadata stream failed, ret = %d", __func__, rc);
-        delete pChannel;
-        return rc;
+    if (!mParameters.isZSLMode()) {
+        // meta data stream always coexists with snapshot in regular RAW capture case
+        rc = addStreamToChannel(pChannel, CAM_STREAM_TYPE_METADATA,
+                metadata_stream_cb_routine, this);
+        if (rc != NO_ERROR) {
+            LOGE("add metadata stream failed, ret = %d", rc);
+            delete pChannel;
+            return rc;
+        }
     }
 
-    rc = addStreamToChannel(pChannel, CAM_STREAM_TYPE_RAW,
-                            raw_stream_cb_routine, this);
+    if (mParameters.getofflineRAW()) {
+        rc = addStreamToChannel(pChannel, CAM_STREAM_TYPE_RAW,
+                NULL, this);
+    } else if (isSecureMode()) {
+        rc = addStreamToChannel(pChannel, CAM_STREAM_TYPE_RAW,
+                secure_stream_cb_routine, this);
+    } else {
+        rc = addStreamToChannel(pChannel, CAM_STREAM_TYPE_RAW,
+                raw_stream_cb_routine, this);
+    }
     if (rc != NO_ERROR) {
-        ALOGE("%s: add snapshot stream failed, ret = %d", __func__, rc);
+        LOGE("add snapshot stream failed, ret = %d", rc);
         delete pChannel;
         return rc;
     }
@@ -6740,10 +8415,11 @@ int32_t QCamera2HardwareInterface::addZSLChannel()
         m_channels[QCAMERA_CH_TYPE_ZSL] = NULL;
     }
 
-    pChannel = new QCameraPicChannel(mCameraHandle->camera_handle,
+    uint32_t handle = getCamHandleForChannel(QCAMERA_CH_TYPE_ZSL);
+    pChannel = new QCameraPicChannel(handle,
                                      mCameraHandle->ops);
     if (NULL == pChannel) {
-        ALOGE("%s: no mem for ZSL channel", __func__);
+        LOGE("no mem for ZSL channel");
         return NO_MEMORY;
     }
 
@@ -6757,78 +8433,88 @@ int32_t QCamera2HardwareInterface::addZSLChannel()
     }
     attr.look_back = mParameters.getZSLBackLookCount();
     attr.post_frame_skip = mParameters.getZSLBurstInterval();
+    if (mParameters.isOEMFeatEnabled()) {
+        LOGD("EDGE SMOOTH frameskip enabled");
+        attr.post_frame_skip += mParameters.isOEMFeatFrameSkipEnabled();
+    }
     attr.water_mark = mParameters.getZSLQueueDepth();
     attr.max_unmatched_frames = mParameters.getMaxUnmatchedFramesInQueue();
-    attr.instant_capture_enabled = (uint8_t)mParameters.isInstantCaptureEnabled();
-    attr.aec_frame_bound = (uint8_t)mParameters.getAecFrameBoundValue();
+    attr.user_expected_frame_id =
+        mParameters.isInstantCaptureEnabled() ? (uint8_t)mParameters.getAecFrameBoundValue() : 0;
 
     //Enabled matched queue
-    if (getRelatedCamSyncInfo()->is_frame_sync_enabled) {
-        CDBG_HIGH("%s: Enabling frame sync for dual camera, camera Id: %d",
-                __func__, mCameraId);
+    if (isFrameSyncEnabled()) {
+        LOGH("Enabling frame sync for dual camera, camera Id: %d",
+                 mCameraId);
         attr.enable_frame_sync = 1;
     }
     rc = pChannel->init(&attr,
                         zsl_channel_cb,
                         this);
     if (rc != 0) {
-        ALOGE("%s: init ZSL channel failed, ret = %d", __func__, rc);
+        LOGE("init ZSL channel failed, ret = %d", rc);
         delete pChannel;
         return rc;
     }
 
     // meta data stream always coexists with preview if applicable
     rc = addStreamToChannel(pChannel, CAM_STREAM_TYPE_METADATA,
-                            metadata_stream_cb_routine, this);
+            metadata_stream_cb_routine, this);
     if (rc != NO_ERROR) {
-        ALOGE("%s: add metadata stream failed, ret = %d", __func__, rc);
+        LOGE("add metadata stream failed, ret = %d", rc);
         delete pChannel;
         return rc;
     }
 
-    if (isNoDisplayMode()) {
+    uint32_t cam_type = CAM_TYPE_MAIN;
+    if (isDualCamera()) {
+        cam_type = MM_CAMERA_DUAL_CAM;
+    }
+    if (isNoDisplayMode(cam_type)) {
         rc = addStreamToChannel(pChannel, CAM_STREAM_TYPE_PREVIEW,
-                                nodisplay_preview_stream_cb_routine, this);
+                nodisplay_preview_stream_cb_routine, this);
     } else {
         rc = addStreamToChannel(pChannel, CAM_STREAM_TYPE_PREVIEW,
-                                preview_stream_cb_routine, this);
-        pChannel->setStreamSyncCB(CAM_STREAM_TYPE_PREVIEW,
-                synchronous_stream_cb_routine);
+                preview_stream_cb_routine, this);
+        //Sync CB is required only on main display preview stream
+        if (needSyncCB(CAM_STREAM_TYPE_PREVIEW) == TRUE) {
+            pChannel->setStreamSyncCB(CAM_STREAM_TYPE_PREVIEW,
+                    synchronous_stream_cb_routine);
+        }
     }
     if (rc != NO_ERROR) {
-        ALOGE("%s: add preview stream failed, ret = %d", __func__, rc);
+        LOGE("add preview stream failed, ret = %d", rc);
         delete pChannel;
         return rc;
     }
 
     rc = addStreamToChannel(pChannel, CAM_STREAM_TYPE_SNAPSHOT,
-                            NULL, this);
+            NULL, this);
     if (rc != NO_ERROR) {
-        ALOGE("%s: add snapshot stream failed, ret = %d", __func__, rc);
+        LOGE("add snapshot stream failed, ret = %d", rc);
         delete pChannel;
         return rc;
     }
 
-    if (!mParameters.isSecureMode() &&
-        (getSensorType() != CAM_SENSOR_Y)) {
+    if (!isSecureMode()) {
         rc = addStreamToChannel(pChannel, CAM_STREAM_TYPE_ANALYSIS,
                 NULL, this);
         if (rc != NO_ERROR) {
-            ALOGE("%s: add Analysis stream failed, ret = %d", __func__, rc);
+            LOGE("add Analysis stream failed, ret = %d", rc);
             delete pChannel;
             return rc;
         }
     }
 
-    property_get("persist.camera.raw_yuv", value, "0");
+    property_get("persist.vendor.camera.raw_yuv", value, "0");
     raw_yuv = atoi(value) > 0 ? true : false;
-    if ( raw_yuv ) {
+    if ((raw_yuv && !mParameters.getofflineRAW()) || mParameters.getRawZsl()) {
         rc = addStreamToChannel(pChannel,
                                 CAM_STREAM_TYPE_RAW,
-                                NULL,
+                                preview_raw_stream_cb_routine,
                                 this);
         if (rc != NO_ERROR) {
-            ALOGE("%s: add raw stream failed, ret = %d", __func__, rc);
+            LOGE("add raw stream failed, ret = %d", rc);
             delete pChannel;
             return rc;
         }
@@ -6864,10 +8550,10 @@ int32_t QCamera2HardwareInterface::addCaptureChannel()
         m_channels[QCAMERA_CH_TYPE_CAPTURE] = NULL;
     }
 
-    pChannel = new QCameraPicChannel(mCameraHandle->camera_handle,
-                                  mCameraHandle->ops);
+    uint32_t handle = getCamHandleForChannel(QCAMERA_CH_TYPE_CAPTURE);
+    pChannel = new QCameraPicChannel(handle, mCameraHandle->ops);
     if (NULL == pChannel) {
-        ALOGE("%s: no mem for capture channel", __func__);
+        LOGE("no mem for capture channel");
         return NO_MEMORY;
     }
 
@@ -6887,62 +8573,67 @@ int32_t QCamera2HardwareInterface::addCaptureChannel()
                         capture_channel_cb_routine,
                         this);
     if (rc != NO_ERROR) {
-        ALOGE("%s: init capture channel failed, ret = %d", __func__, rc);
+        LOGE("init capture channel failed, ret = %d", rc);
+        delete pChannel;
         return rc;
     }
 
     // meta data stream always coexists with snapshot in regular capture case
     rc = addStreamToChannel(pChannel, CAM_STREAM_TYPE_METADATA,
-                            metadata_stream_cb_routine, this);
+            metadata_stream_cb_routine, this);
     if (rc != NO_ERROR) {
-        ALOGE("%s: add metadata stream failed, ret = %d", __func__, rc);
+        LOGE("add metadata stream failed, ret = %d", rc);
+        delete pChannel;
         return rc;
     }
 
-    if (!mLongshotEnabled) {
+    if (mLongshotEnabled) {
+        rc = addStreamToChannel(pChannel, CAM_STREAM_TYPE_PREVIEW,
+                preview_stream_cb_routine, this);
+        if (rc != NO_ERROR) {
+            LOGE("add preview stream failed, ret = %d", rc);
+            delete pChannel;
+            return rc;
+        }
+        if (needSyncCB(CAM_STREAM_TYPE_PREVIEW) == TRUE) {
+            pChannel->setStreamSyncCB(CAM_STREAM_TYPE_PREVIEW,
+                    synchronous_stream_cb_routine);
+        }
+    //Not adding the postview stream to the capture channel if Quadra CFA is enabled.
+    } else if (!mParameters.getQuadraCfa()) {
         rc = addStreamToChannel(pChannel, CAM_STREAM_TYPE_POSTVIEW,
                                 NULL, this);
-
         if (rc != NO_ERROR) {
-            ALOGE("%s: add postview stream failed, ret = %d", __func__, rc);
+            LOGE("add postview stream failed, ret = %d", rc);
+            delete pChannel;
             return rc;
         }
-    } else {
-        rc = addStreamToChannel(pChannel, CAM_STREAM_TYPE_PREVIEW,
-                                preview_stream_cb_routine, this);
-
-        if (rc != NO_ERROR) {
-            ALOGE("%s: add preview stream failed, ret = %d", __func__, rc);
-            return rc;
-        }
-        pChannel->setStreamSyncCB(CAM_STREAM_TYPE_PREVIEW,
-                synchronous_stream_cb_routine);
     }
 
     if (!mParameters.getofflineRAW()) {
         rc = addStreamToChannel(pChannel, CAM_STREAM_TYPE_SNAPSHOT,
                 NULL, this);
         if (rc != NO_ERROR) {
-            ALOGE("%s: add snapshot stream failed, ret = %d", __func__, rc);
+            LOGE("add snapshot stream failed, ret = %d", rc);
+            delete pChannel;
             return rc;
         }
     }
-    property_get("persist.camera.raw_yuv", value, "0");
+
+    stream_cb_routine stream_cb = NULL;
+    property_get("persist.vendor.camera.raw_yuv", value, "0");
     raw_yuv = atoi(value) > 0 ? true : false;
-    if ( raw_yuv ) {
-        if (!mParameters.getofflineRAW()) {
-            rc = addStreamToChannel(pChannel,
-                    CAM_STREAM_TYPE_RAW,
-                    snapshot_raw_stream_cb_routine,
-                    this);
-        } else {
-            rc = addStreamToChannel(pChannel,
-                    CAM_STREAM_TYPE_RAW,
-                    NULL,
-                    this);
-        }
+
+    if (raw_yuv) {
+        stream_cb = snapshot_raw_stream_cb_routine;
+    }
+
+    if ((raw_yuv) || (mParameters.getofflineRAW())) {
+        rc = addStreamToChannel(pChannel,
+                CAM_STREAM_TYPE_RAW, stream_cb, this);
         if (rc != NO_ERROR) {
-            ALOGE("%s: add raw stream failed, ret = %d", __func__, rc);
+            LOGE("add raw stream failed, ret = %d", rc);
+            delete pChannel;
             return rc;
         }
     }
@@ -6972,10 +8663,10 @@ int32_t QCamera2HardwareInterface::addMetaDataChannel()
         m_channels[QCAMERA_CH_TYPE_METADATA] = NULL;
     }
 
-    pChannel = new QCameraChannel(mCameraHandle->camera_handle,
-                                  mCameraHandle->ops);
+    uint32_t handle = getCamHandleForChannel(QCAMERA_CH_TYPE_METADATA);
+    pChannel = new QCameraChannel(handle, mCameraHandle->ops);
     if (NULL == pChannel) {
-        ALOGE("%s: no mem for metadata channel", __func__);
+        LOGE("no mem for metadata channel");
         return NO_MEMORY;
     }
 
@@ -6983,15 +8674,15 @@ int32_t QCamera2HardwareInterface::addMetaDataChannel()
                         NULL,
                         NULL);
     if (rc != NO_ERROR) {
-        ALOGE("%s: init metadata channel failed, ret = %d", __func__, rc);
+        LOGE("init metadata channel failed, ret = %d", rc);
         delete pChannel;
         return rc;
     }
 
     rc = addStreamToChannel(pChannel, CAM_STREAM_TYPE_METADATA,
-                            metadata_stream_cb_routine, this);
+            metadata_stream_cb_routine, this);
     if (rc != NO_ERROR) {
-        ALOGE("%s: add metadata stream failed, ret = %d", __func__, rc);
+        LOGE("add metadata stream failed, ret = %d", rc);
         delete pChannel;
         return rc;
     }
@@ -7021,17 +8712,17 @@ int32_t QCamera2HardwareInterface::addCallbackChannel()
         m_channels[QCAMERA_CH_TYPE_CALLBACK] = NULL;
     }
 
-    pChannel = new QCameraChannel(mCameraHandle->camera_handle,
-            mCameraHandle->ops);
+    uint32_t handle = getCamHandleForChannel(QCAMERA_CH_TYPE_CALLBACK);
+    pChannel = new QCameraChannel(handle, mCameraHandle->ops);
     if (NULL == pChannel) {
-        ALOGE("%s: no mem for callback channel", __func__);
+        LOGE("no mem for callback channel");
         return NO_MEMORY;
     }
 
     rc = pChannel->init(NULL, NULL, this);
     if (rc != NO_ERROR) {
-        ALOGE("%s: init callback channel failed, ret = %d",
-                __func__, rc);
+        LOGE("init callback channel failed, ret = %d",
+                 rc);
         delete pChannel;
         return rc;
     }
@@ -7039,7 +8730,7 @@ int32_t QCamera2HardwareInterface::addCallbackChannel()
     rc = addStreamToChannel(pChannel, CAM_STREAM_TYPE_CALLBACK,
             callback_stream_cb_routine, this);
     if (rc != NO_ERROR) {
-        ALOGE("%s: add callback stream failed, ret = %d", __func__, rc);
+        LOGE("add callback stream failed, ret = %d", rc);
         delete pChannel;
         return rc;
     }
@@ -7070,24 +8761,24 @@ int32_t QCamera2HardwareInterface::addAnalysisChannel()
         m_channels[QCAMERA_CH_TYPE_ANALYSIS] = NULL;
     }
 
-    pChannel = new QCameraChannel(mCameraHandle->camera_handle,
-                                  mCameraHandle->ops);
+    uint32_t handle = getCamHandleForChannel(QCAMERA_CH_TYPE_ANALYSIS);
+    pChannel = new QCameraChannel(handle, mCameraHandle->ops);
     if (NULL == pChannel) {
-        ALOGE("%s: no mem for metadata channel", __func__);
+        LOGE("no mem for metadata channel");
         return NO_MEMORY;
     }
 
     rc = pChannel->init(NULL, NULL, this);
     if (rc != NO_ERROR) {
-        ALOGE("%s: init Analysis channel failed, ret = %d", __func__, rc);
+        LOGE("init Analysis channel failed, ret = %d", rc);
         delete pChannel;
         return rc;
     }
 
     rc = addStreamToChannel(pChannel, CAM_STREAM_TYPE_ANALYSIS,
-                            NULL, this);
+            NULL, this);
     if (rc != NO_ERROR) {
-        ALOGE("%s: add Analysis stream failed, ret = %d", __func__, rc);
+        LOGE("add Analysis stream failed, ret = %d", rc);
         delete pChannel;
         return rc;
     }
@@ -7104,30 +8795,51 @@ int32_t QCamera2HardwareInterface::addAnalysisChannel()
  *
  * PARAMETERS :
  * @pp config:  pp config structure pointer,
- * @curCount:  current pp pass count
+ * @curIndex:  current pp channel index
+ * @multipass: Flag if multipass prcessing enabled.
  *
  * RETURN     : int32_t type of status
  *              NO_ERROR  -- success
  *              none-zero failure code
  *==========================================================================*/
-int32_t QCamera2HardwareInterface::getPPConfig(cam_pp_feature_config_t &pp_config, int curCount)
+int32_t QCamera2HardwareInterface::getPPConfig(cam_pp_feature_config_t &pp_config,
+        int8_t curIndex, bool multipass)
 {
     int32_t rc = NO_ERROR;
+    int32_t feature_set = 0;
 
-    if ( curCount != mParameters.getReprocCount() ) {
-        ALOGW("%s : Multi pass enabled. Total Pass = %d, cur Pass = %d", __func__,
-                mParameters.getReprocCount(), curCount);
+    if (multipass) {
+        LOGW("Multi pass enabled. Total Pass = %d, cur index = %d",
+                mParameters.getReprocCount(), curIndex);
     }
 
-    CDBG_HIGH("%s: Supported pproc feature mask = %x", __func__,
+    LOGH("Supported pproc feature mask = %llx",
             gCamCapability[mCameraId]->qcom_supported_feature_mask);
-    uint32_t feature_mask = gCamCapability[mCameraId]->qcom_supported_feature_mask;
+    cam_feature_mask_t feature_mask = gCamCapability[mCameraId]->qcom_supported_feature_mask;
     int32_t zoomLevel = mParameters.getParmZoomLevel();
     uint32_t rotation = mParameters.getJpegRotation();
     int32_t effect = mParameters.getEffectValue();
 
-    switch(curCount) {
-        case 1:
+    pp_config.cur_reproc_count = curIndex + 1;
+    pp_config.total_reproc_count = mParameters.getReprocCount();
+
+    //Checking what feature mask to enable
+    if (curIndex == 0) {
+        if (mParameters.getQuadraCfa()) {
+            feature_set = 2;
+        } else {
+            feature_set = 0;
+        }
+    } else if (curIndex == 1) {
+        if (mParameters.getQuadraCfa()) {
+            feature_set = 0;
+        } else {
+            feature_set = 1;
+        }
+    }
+
+    switch(feature_set) {
+        case 0:
             //Configure feature mask for first pass of reprocessing
             //check if any effects are enabled
             if ((CAM_EFFECT_MODE_OFF != effect) &&
@@ -7141,7 +8853,7 @@ int32_t QCamera2HardwareInterface::getPPConfig(cam_pp_feature_config_t &pp_confi
             if ((feature_mask & CAM_QCOM_FEATURE_SHARPNESS) &&
                 !mParameters.isOptiZoomEnabled()) {
                 pp_config.feature_mask |= CAM_QCOM_FEATURE_SHARPNESS;
-                pp_config.sharpness = mParameters.getInt(QCameraParameters::KEY_QC_SHARPNESS);
+                pp_config.sharpness = mParameters.getSharpness();
             }
 
             //check if zoom is enabled
@@ -7187,10 +8899,10 @@ int32_t QCamera2HardwareInterface::getPPConfig(cam_pp_feature_config_t &pp_confi
 
             //check if scaling is enabled
             if ((feature_mask & CAM_QCOM_FEATURE_SCALE) &&
-                mParameters.m_reprocScaleParam.isScaleEnabled() &&
-                mParameters.m_reprocScaleParam.isUnderScaling()){
+                mParameters.isReprocScaleEnabled() &&
+                mParameters.isUnderReprocScaling()){
                 pp_config.feature_mask |= CAM_QCOM_FEATURE_SCALE;
-                mParameters.m_reprocScaleParam.getPicSizeFromAPK(
+                mParameters.getPicSizeFromAPK(
                         pp_config.scale_param.output_width,
                         pp_config.scale_param.output_height);
             }
@@ -7239,6 +8951,10 @@ int32_t QCamera2HardwareInterface::getPPConfig(cam_pp_feature_config_t &pp_confi
                 pp_config.feature_mask &= ~CAM_QCOM_FEATURE_STILLMORE;
             }
 
+            if (mParameters.isOEMFeatEnabled()) {
+                pp_config.feature_mask |= CAM_OEM_FEATURE_1;
+            }
+
             if (mParameters.getCDSMode() != CAM_CDS_MODE_OFF) {
                 if (feature_mask & CAM_QCOM_FEATURE_DSDN) {
                     pp_config.feature_mask |= CAM_QCOM_FEATURE_DSDN;
@@ -7247,7 +8963,9 @@ int32_t QCamera2HardwareInterface::getPPConfig(cam_pp_feature_config_t &pp_confi
                 }
             }
 
-            if (curCount != mParameters.getReprocCount()) {
+            if ((multipass) &&
+                    (m_postprocessor.getPPChannelCount() > 1)
+                    && (!mParameters.getQuadraCfa())) {
                 pp_config.feature_mask &= ~CAM_QCOM_FEATURE_PP_PASS_2;
                 pp_config.feature_mask &= ~CAM_QCOM_FEATURE_ROTATION;
                 pp_config.feature_mask &= ~CAM_QCOM_FEATURE_CDS;
@@ -7270,7 +8988,7 @@ int32_t QCamera2HardwareInterface::getPPConfig(cam_pp_feature_config_t &pp_confi
 
             break;
 
-        case 2:
+        case 1:
             //Configure feature mask for second pass of reprocessing
             pp_config.feature_mask |= CAM_QCOM_FEATURE_PP_PASS_2;
             if ((feature_mask & CAM_QCOM_FEATURE_ROTATION) && (rotation > 0)) {
@@ -7292,11 +9010,20 @@ int32_t QCamera2HardwareInterface::getPPConfig(cam_pp_feature_config_t &pp_confi
                     pp_config.feature_mask |= CAM_QCOM_FEATURE_CDS;
                 }
             }
+            pp_config.feature_mask &= ~CAM_QCOM_FEATURE_RAW_PROCESSING;
+            pp_config.feature_mask &= ~CAM_QCOM_FEATURE_METADATA_PROCESSING;
+            pp_config.feature_mask &= ~CAM_QCOM_FEATURE_METADATA_BYPASS;
+            break;
+
+        case 2:
+            //Setting feature for Quadra CFA
+            pp_config.feature_mask |= CAM_QCOM_FEATURE_QUADRA_CFA;
             break;
 
     }
-    CDBG_HIGH("%s: pproc feature mask set = %x pass count = %d",
-            __func__, pp_config.feature_mask,curCount);
+
+    LOGH("pproc feature mask set = %llx pass count = %d",
+        pp_config.feature_mask, curIndex);
     return rc;
 }
 
@@ -7308,24 +9035,26 @@ int32_t QCamera2HardwareInterface::getPPConfig(cam_pp_feature_config_t &pp_confi
  *
  * PARAMETERS :
  *   @pInputChannel : ptr to input channel whose frames will be post-processed
+ *   @cur_channel_index : Current channel index in multipass
  *
  * RETURN     : Ptr to the newly created channel obj. NULL if failed.
  *==========================================================================*/
 QCameraReprocessChannel *QCamera2HardwareInterface::addReprocChannel(
-                                                      QCameraChannel *pInputChannel)
+        QCameraChannel *pInputChannel, int8_t cur_channel_index)
 {
     int32_t rc = NO_ERROR;
     QCameraReprocessChannel *pChannel = NULL;
+    uint32_t burst_cnt = mParameters.getNumOfSnapshots();
+    uint32_t pHandle = getCamHandleForChannel(QCAMERA_CH_TYPE_REPROCESSING);
 
     if (pInputChannel == NULL) {
-        ALOGE("%s: input channel obj is NULL", __func__);
+        LOGE("input channel obj is NULL");
         return NULL;
     }
 
-    pChannel = new QCameraReprocessChannel(mCameraHandle->camera_handle,
-                                           mCameraHandle->ops);
+    pChannel = new QCameraReprocessChannel(pHandle, mCameraHandle->ops);
     if (NULL == pChannel) {
-        ALOGE("%s: no mem for reprocess channel", __func__);
+        LOGE("no mem for reprocess channel");
         return NULL;
     }
 
@@ -7338,7 +9067,7 @@ QCameraReprocessChannel *QCamera2HardwareInterface::addReprocChannel(
                         postproc_channel_cb_routine,
                         this);
     if (rc != NO_ERROR) {
-        ALOGE("%s: init reprocess channel failed, ret = %d", __func__, rc);
+        LOGE("init reprocess channel failed, ret = %d", rc);
         delete pChannel;
         return NULL;
     }
@@ -7347,9 +9076,10 @@ QCameraReprocessChannel *QCamera2HardwareInterface::addReprocChannel(
     cam_pp_feature_config_t pp_config;
     memset(&pp_config, 0, sizeof(cam_pp_feature_config_t));
 
-    rc = getPPConfig(pp_config, mParameters.getCurPPCount());
+    rc = getPPConfig(pp_config, cur_channel_index,
+            ((mParameters.getReprocCount() > 1) ? TRUE : FALSE));
     if (rc != NO_ERROR){
-        ALOGE("%s: Error while creating PP config",__func__);
+        LOGE("Error while creating PP config");
         delete pChannel;
         return NULL;
     }
@@ -7357,7 +9087,7 @@ QCameraReprocessChannel *QCamera2HardwareInterface::addReprocChannel(
     uint8_t minStreamBufNum = getBufNumRequired(CAM_STREAM_TYPE_OFFLINE_PROC);
 
     //WNR and HDR happen inline. No extra buffers needed.
-    uint32_t temp_feature_mask = pp_config.feature_mask;
+    cam_feature_mask_t temp_feature_mask = pp_config.feature_mask;
     temp_feature_mask &= ~CAM_QCOM_FEATURE_HDR;
     if (temp_feature_mask && mParameters.isHDREnabled()) {
         minStreamBufNum = (uint8_t)(1 + mParameters.getNumOfExtraHDRInBufsIfNeeded());
@@ -7366,7 +9096,7 @@ QCameraReprocessChannel *QCamera2HardwareInterface::addReprocChannel(
     if (mParameters.isStillMoreEnabled()) {
         cam_still_more_t stillmore_config = mParameters.getStillMoreSettings();
         pp_config.burst_cnt = stillmore_config.burst_count;
-        CDBG_HIGH("%s: Stillmore burst %d", __func__, pp_config.burst_cnt);
+        LOGH("Stillmore burst %d", pp_config.burst_cnt);
 
         // getNumOfExtraBuffersForImageProc returns 1 less buffer assuming
         // number of capture is already added. In the case of liveshot,
@@ -7374,6 +9104,23 @@ QCameraReprocessChannel *QCamera2HardwareInterface::addReprocChannel(
         if (mParameters.getNumOfExtraBuffersForImageProc() == 0) {
             minStreamBufNum += 1;
         }
+    }
+
+    if (mParameters.getManualCaptureMode() >= CAM_MANUAL_CAPTURE_TYPE_3) {
+        minStreamBufNum += mParameters.getReprocCount() - 1;
+        burst_cnt = mParameters.getReprocCount();
+        if (cur_channel_index == 0) {
+            pChannel->setReprocCount(2);
+        } else {
+            pChannel->setReprocCount(1);
+        }
+    } else {
+        pChannel->setReprocCount(1);
+    }
+
+    if (isDualCamera() && mBundledSnapshot && !mParameters.isDCmAsymmetricSnapMode()) {
+        // Add extra buffer only if snapshot resolution is symmetric
+        minStreamBufNum += 1;
     }
 
     // Add non inplace image lib buffers only when ppproc is present,
@@ -7388,21 +9135,27 @@ QCameraReprocessChannel *QCamera2HardwareInterface::addReprocChannel(
     }
 
     //Mask out features that are already processed in snapshot stream.
-    uint32_t snapshot_feature_mask = 0;
+    cam_feature_mask_t snapshot_feature_mask = 0;
     mParameters.getStreamPpMask(CAM_STREAM_TYPE_SNAPSHOT, snapshot_feature_mask);
 
     pp_config.feature_mask &= ~snapshot_feature_mask;
-    ALOGI("%s: Snapshot feature mask: 0x%x, reproc feature mask: 0x%x", __func__,
-            snapshot_feature_mask, pp_config.feature_mask);
+    LOGH("Snapshot feature mask: 0x%llx, reproc feature mask: 0x%llx minStreamBufNum = %d",
+            snapshot_feature_mask, pp_config.feature_mask, minStreamBufNum);
 
-    bool offlineReproc = isRegularCapture();
-    cam_padding_info_t* paddingInfo = &gCamCapability[mCameraId]->padding_info;
+    bool offlineReproc = needOfflineReprocessing();
+    if (m_postprocessor.mOfflineDataBufs != NULL) {
+        offlineReproc = TRUE;
+    }
+
+    cam_padding_info_t paddingInfo = gCamCapability[mCameraId]->padding_info;
+    paddingInfo.offset_info.offset_x = 0;
+    paddingInfo.offset_info.offset_y = 0;
     rc = pChannel->addReprocStreamsFromSource(*this,
                                               pp_config,
                                               pInputChannel,
                                               minStreamBufNum,
-                                              mParameters.getNumOfSnapshots(),
-                                              paddingInfo,
+                                              burst_cnt,
+                                              &paddingInfo,
                                               mParameters,
                                               mLongshotEnabled,
                                               offlineReproc);
@@ -7411,6 +9164,9 @@ QCameraReprocessChannel *QCamera2HardwareInterface::addReprocChannel(
         return NULL;
     }
 
+    if (isDualCamera()) {
+        pChannel->initDCSettings(mActiveCameras, mMasterCamera, mBundledSnapshot);
+    }
     return pChannel;
 }
 
@@ -7440,20 +9196,20 @@ QCameraReprocessChannel *QCamera2HardwareInterface::addOfflineReprocChannel(
     pChannel = new QCameraReprocessChannel(mCameraHandle->camera_handle,
                                            mCameraHandle->ops);
     if (NULL == pChannel) {
-        ALOGE("%s: no mem for reprocess channel", __func__);
+        LOGE("no mem for reprocess channel");
         return NULL;
     }
 
     rc = pChannel->init(NULL, NULL, NULL);
     if (rc != NO_ERROR) {
-        ALOGE("%s: init reprocess channel failed, ret = %d", __func__, rc);
+        LOGE("init reprocess channel failed, ret = %d", rc);
         delete pChannel;
         return NULL;
     }
 
     QCameraHeapMemory *pStreamInfo = allocateStreamInfoBuf(CAM_STREAM_TYPE_OFFLINE_PROC);
     if (pStreamInfo == NULL) {
-        ALOGE("%s: no mem for stream info buf", __func__);
+        LOGE("no mem for stream info buf");
         delete pChannel;
         return NULL;
     }
@@ -7470,14 +9226,15 @@ QCameraReprocessChannel *QCamera2HardwareInterface::addOfflineReprocChannel(
     streamInfoBuf->reprocess_config.pp_type = CAM_OFFLINE_REPROCESS_TYPE;
     streamInfoBuf->reprocess_config.offline = img_config;
     streamInfoBuf->reprocess_config.pp_feature_config = pp_feature;
+    streamInfoBuf->num_bufs = img_config.num_of_bufs;
 
     rc = pChannel->addStream(*this,
-            pStreamInfo, NULL, img_config.num_of_bufs,
+            pStreamInfo, NULL,
             &gCamCapability[mCameraId]->padding_info,
             stream_cb, userdata, false);
 
     if (rc != NO_ERROR) {
-        ALOGE("%s: add reprocess stream failed, ret = %d", __func__, rc);
+        LOGE("add reprocess stream failed, ret = %d", rc);
         delete pChannel;
         return NULL;
     }
@@ -7618,22 +9375,26 @@ int32_t QCamera2HardwareInterface::stopChannel(qcamera_ch_type_enum_t ch_type)
  *==========================================================================*/
 int32_t QCamera2HardwareInterface::preparePreview()
 {
-    ATRACE_CALL();
+    ATRACE_CAMSCOPE_CALL(CAMSCOPE_HAL1_PREPAREPREVIEW);
     int32_t rc = NO_ERROR;
 
-    pthread_mutex_lock(&m_parm_lock);
+    LOGI("E");
     rc = mParameters.setStreamConfigure(false, false, false);
     if (rc != NO_ERROR) {
-        ALOGE("%s: setStreamConfigure failed %d", __func__, rc);
-        pthread_mutex_unlock(&m_parm_lock);
+        LOGE("setStreamConfigure failed %d", rc);
         return rc;
     }
-    pthread_mutex_unlock(&m_parm_lock);
+
+    //Trigger deferred job second camera
+    if (isDualCamera()) {
+        initDCSettings();
+        mParameters.setDCDeferCamera(CAM_DEFER_START);
+    }
 
     if (mParameters.isZSLMode() && mParameters.getRecordingHintValue() != true) {
         rc = addChannel(QCAMERA_CH_TYPE_ZSL);
         if (rc != NO_ERROR) {
-            ALOGE("%s[%d]: failed!! rc = %d", __func__, __LINE__, rc);
+            LOGE("failed!! rc = %d", rc);
             return rc;
         }
 
@@ -7644,22 +9405,33 @@ int32_t QCamera2HardwareInterface::preparePreview()
                 rc = addChannel(QCAMERA_CH_TYPE_CALLBACK);
                 if (rc != NO_ERROR) {
                     delChannel(QCAMERA_CH_TYPE_ZSL);
-                    ALOGE("%s[%d]:failed!! rc = %d", __func__, __LINE__, rc);
+                    LOGE("failed!! rc = %d", rc);
                     return rc;
                 }
             }
+        }
+
+        if (mParameters.getofflineRAW() && !mParameters.getQuadraCfa()
+                && !mParameters.getRawZsl()) {
+            addChannel(QCAMERA_CH_TYPE_RAW);
+        }
+    } else if(isSecureMode()) {
+        if (mParameters.getSecureStreamType() == CAM_STREAM_TYPE_RAW && !isRdiMode()) {
+            rc = addChannel(QCAMERA_CH_TYPE_RAW);
+        } else {
+            rc = addChannel(QCAMERA_CH_TYPE_PREVIEW);
         }
     } else {
         bool recordingHint = mParameters.getRecordingHintValue();
         if(!isRdiMode() && recordingHint) {
             //stop face detection,longshot,etc if turned ON in Camera mode
-            int32_t arg; //dummy arg
 #ifndef VANILLA_HAL
+            int32_t arg; //dummy arg
             if (isLongshotEnabled()) {
                 sendCommand(CAMERA_CMD_LONGSHOT_OFF, arg, arg);
             }
             if (mParameters.isFaceDetectionEnabled()
-                    && (!mParameters.isFDInVideoEnabled())) {
+                    && (!mParameters.fdModeInVideo())) {
                 sendCommand(CAMERA_CMD_STOP_FACE_DETECTION, arg, arg);
             }
             if (mParameters.isHistogramEnabled()) {
@@ -7674,12 +9446,13 @@ int32_t QCamera2HardwareInterface::preparePreview()
                    return rc;
                }
             }
-
-            rc = addChannel(QCAMERA_CH_TYPE_VIDEO);
-            if (rc != NO_ERROR) {
-                delChannel(QCAMERA_CH_TYPE_SNAPSHOT);
-                ALOGE("%s[%d]:failed!! rc = %d", __func__, __LINE__, rc);
-                return rc;
+            if (!(m_bNeedVideoCb)) {
+                rc = addChannel(QCAMERA_CH_TYPE_VIDEO);
+                if (rc != NO_ERROR) {
+                    delChannel(QCAMERA_CH_TYPE_SNAPSHOT);
+                    LOGE("failed!! rc = %d", rc);
+                    return rc;
+                }
             }
         }
 
@@ -7702,7 +9475,7 @@ int32_t QCamera2HardwareInterface::preparePreview()
                         delChannel(QCAMERA_CH_TYPE_SNAPSHOT);
                         delChannel(QCAMERA_CH_TYPE_VIDEO);
                     }
-                    ALOGE("%s[%d]:failed!! rc = %d", __func__, __LINE__, rc);
+                    LOGE("failed!! rc = %d", rc);
                     return rc;
                 }
             }
@@ -7710,10 +9483,19 @@ int32_t QCamera2HardwareInterface::preparePreview()
 
         if (NO_ERROR != rc) {
             delChannel(QCAMERA_CH_TYPE_PREVIEW);
-            ALOGE("%s[%d]:failed!! rc = %d", __func__, __LINE__, rc);
+            LOGE("failed!! rc = %d", rc);
         }
     }
 
+    if (isDualCamera()) {
+        if (rc == NO_ERROR) {
+            updateDCSettings();
+        } else {
+            mParameters.setDCDeferCamera(CAM_DEFER_FLUSH);
+        }
+    }
+
+    LOGI("X rc = %d", rc);
     return rc;
 }
 
@@ -7728,11 +9510,15 @@ int32_t QCamera2HardwareInterface::preparePreview()
  *==========================================================================*/
 void QCamera2HardwareInterface::unpreparePreview()
 {
+    if (isDualCamera()) {
+        mParameters.setDCDeferCamera(CAM_DEFER_FLUSH);
+    }
     delChannel(QCAMERA_CH_TYPE_ZSL);
     delChannel(QCAMERA_CH_TYPE_PREVIEW);
     delChannel(QCAMERA_CH_TYPE_VIDEO);
     delChannel(QCAMERA_CH_TYPE_SNAPSHOT);
     delChannel(QCAMERA_CH_TYPE_CALLBACK);
+    delChannel(QCAMERA_CH_TYPE_RAW);
 }
 
 /*===========================================================================
@@ -7747,10 +9533,10 @@ void QCamera2HardwareInterface::unpreparePreview()
 void QCamera2HardwareInterface::playShutter(){
      if (mNotifyCb == NULL ||
          msgTypeEnabledWithLock(CAMERA_MSG_SHUTTER) == 0){
-         CDBG("%s: shutter msg not enabled or NULL cb", __func__);
+         LOGD("shutter msg not enabled or NULL cb");
          return;
      }
-     CDBG_HIGH("%s: CAMERA_MSG_SHUTTER ", __func__);
+     LOGH("CAMERA_MSG_SHUTTER ");
      qcamera_callback_argm_t cbArg;
      memset(&cbArg, 0, sizeof(qcamera_callback_argm_t));
      cbArg.cb_type = QCAMERA_NOTIFY_CALLBACK;
@@ -7774,7 +9560,7 @@ QCameraChannel *QCamera2HardwareInterface::getChannelByHandle(uint32_t channelHa
 {
     for(int i = 0; i < QCAMERA_CH_TYPE_MAX; i++) {
         if (m_channels[i] != NULL &&
-            m_channels[i]->getMyHandle() == channelHandle) {
+            (validate_handle(m_channels[i]->getMyHandle(), channelHandle))) {
             return m_channels[i];
         }
     }
@@ -7787,7 +9573,7 @@ QCameraChannel *QCamera2HardwareInterface::getChannelByHandle(uint32_t channelHa
  * DESCRIPTION: decides if needPreviewFDCallback
  *
  * PARAMETERS :
- *   @fd_data : number of faces
+ *   @num_faces : number of faces
  *
  * RETURN     : bool type of status
  *              true  -- success
@@ -7808,32 +9594,37 @@ bool QCamera2HardwareInterface::needPreviewFDCallback(uint8_t num_faces)
  * DESCRIPTION: process face detection reuslt
  *
  * PARAMETERS :
- *   @fd_data : ptr to face detection result struct
+ *   @faces_data : ptr to face processing result struct
  *
  * RETURN     : int32_t type of status
  *              NO_ERROR  -- success
  *              none-zero failure code
  *==========================================================================*/
-int32_t QCamera2HardwareInterface::processFaceDetectionResult(cam_face_detection_data_t *fd_data)
+int32_t QCamera2HardwareInterface::processFaceDetectionResult(cam_faces_data_t *faces_data)
 {
     if (!mParameters.isFaceDetectionEnabled()) {
-        CDBG_HIGH("%s: FaceDetection not enabled, no ops here", __func__);
+        LOGH("FaceDetection not enabled, no ops here");
         return NO_ERROR;
     }
 
-    qcamera_face_detect_type_t fd_type = fd_data->fd_type;
+    qcamera_face_detect_type_t fd_type = faces_data->detection_data.fd_type;
+    if ((fd_type != QCAMERA_FD_PREVIEW) && (fd_type != QCAMERA_FD_SNAPSHOT)) {
+        LOGE("Unknown fd type");
+        return UNKNOWN_ERROR;
+    }
+    cam_face_detection_data_t *detect_data = &(faces_data->detection_data);
     if ((NULL == mDataCb) ||
         (fd_type == QCAMERA_FD_PREVIEW && !msgTypeEnabled(CAMERA_MSG_PREVIEW_METADATA)) ||
-        (!needPreviewFDCallback(fd_data->num_faces_detected))
+        (!needPreviewFDCallback(detect_data->num_faces_detected))
 #ifndef VANILLA_HAL
         || (fd_type == QCAMERA_FD_SNAPSHOT && !msgTypeEnabled(CAMERA_MSG_META_DATA))
 #endif
         ) {
-        CDBG_HIGH("%s: metadata msgtype not enabled, no ops here", __func__);
+        LOGH("metadata msgtype not enabled, no ops here");
         return NO_ERROR;
     }
 
-    if ((fd_type == QCAMERA_FD_PREVIEW) && (fd_data->update_flag == FALSE)) {
+    if ((fd_type == QCAMERA_FD_PREVIEW) && (detect_data->update_flag == FALSE)) {
         // Don't send callback to app if this is skipped by fd at backend
         return NO_ERROR;
     }
@@ -7841,8 +9632,8 @@ int32_t QCamera2HardwareInterface::processFaceDetectionResult(cam_face_detection
     cam_dimension_t display_dim;
     mParameters.getStreamDimension(CAM_STREAM_TYPE_PREVIEW, display_dim);
     if (display_dim.width <= 0 || display_dim.height <= 0) {
-        ALOGE("%s: Invalid preview width or height (%d x %d)",
-              __func__, display_dim.width, display_dim.height);
+        LOGE("Invalid preview width or height (%d x %d)",
+               display_dim.width, display_dim.height);
         return UNKNOWN_ERROR;
     }
 
@@ -7858,9 +9649,9 @@ int32_t QCamera2HardwareInterface::processFaceDetectionResult(cam_face_detection
 #ifndef VANILLA_HAL
         // fd for snapshot frames
         //check if face is detected in this frame
-        if(fd_data->num_faces_detected > 0){
+        if(detect_data->num_faces_detected > 0){
             data_len = sizeof(camera_frame_metadata_t) +
-                         sizeof(camera_face_t) * fd_data->num_faces_detected;
+                    sizeof(camera_face_t) * detect_data->num_faces_detected;
         }else{
             //no face
             data_len = 0;
@@ -7876,8 +9667,7 @@ int32_t QCamera2HardwareInterface::processFaceDetectionResult(cam_face_detection
                                                    1,
                                                    mCallbackCookie);
     if ( NULL == faceResultBuffer ) {
-        ALOGE("%s: Not enough memory for face result data",
-              __func__);
+        LOGE("Not enough memory for face result data");
         return NO_MEMORY;
     }
 
@@ -7886,7 +9676,7 @@ int32_t QCamera2HardwareInterface::processFaceDetectionResult(cam_face_detection
     unsigned char *faceData = NULL;
     if(fd_type == QCAMERA_FD_PREVIEW){
         faceData = pFaceResult;
-        mNumPreviewFaces = fd_data->num_faces_detected;
+        mNumPreviewFaces = detect_data->num_faces_detected;
     }else if(fd_type == QCAMERA_FD_SNAPSHOT){
 #ifndef VANILLA_HAL
         //need fill meta type and meta data len first
@@ -7906,7 +9696,7 @@ int32_t QCamera2HardwareInterface::processFaceDetectionResult(cam_face_detection
             cbArg.release_cb = releaseCameraMemory;
             int32_t rc = m_cbNotifier.notifyCallback(cbArg);
             if (rc != NO_ERROR) {
-                ALOGE("%s: fail sending notification", __func__);
+                LOGE("fail sending notification");
                 faceResultBuffer->release(faceResultBuffer);
             }
             return rc;
@@ -7918,71 +9708,150 @@ int32_t QCamera2HardwareInterface::processFaceDetectionResult(cam_face_detection
     camera_frame_metadata_t *roiData = (camera_frame_metadata_t * ) faceData;
     camera_face_t *faces = (camera_face_t *) ( faceData + sizeof(camera_frame_metadata_t) );
 
-    roiData->number_of_faces = fd_data->num_faces_detected;
+    roiData->number_of_faces = detect_data->num_faces_detected;
     roiData->faces = faces;
+    LOGL("FD_DEBUG : Frame[%d] : number_of_faces=%d, display_dim=%d %d",
+            detect_data->frame_id, detect_data->num_faces_detected,
+            display_dim.width, display_dim.height);
     if (roiData->number_of_faces > 0) {
         for (int i = 0; i < roiData->number_of_faces; i++) {
-            faces[i].id = fd_data->faces[i].face_id;
-            faces[i].score = fd_data->faces[i].score;
+            faces[i].id = detect_data->faces[i].face_id;
+            faces[i].score = detect_data->faces[i].score;
 
             // left
-            faces[i].rect[0] =
-                MAP_TO_DRIVER_COORDINATE(fd_data->faces[i].face_boundary.left, display_dim.width, 2000, -1000);
+            faces[i].rect[0] = MAP_TO_DRIVER_COORDINATE(
+                    detect_data->faces[i].face_boundary.left,
+                    display_dim.width, 2000, -1000);
 
             // top
-            faces[i].rect[1] =
-                MAP_TO_DRIVER_COORDINATE(fd_data->faces[i].face_boundary.top, display_dim.height, 2000, -1000);
+            faces[i].rect[1] = MAP_TO_DRIVER_COORDINATE(
+                    detect_data->faces[i].face_boundary.top,
+                    display_dim.height, 2000, -1000);
 
             // right
             faces[i].rect[2] = faces[i].rect[0] +
-                MAP_TO_DRIVER_COORDINATE(fd_data->faces[i].face_boundary.width, display_dim.width, 2000, 0);
+                    MAP_TO_DRIVER_COORDINATE(
+                    detect_data->faces[i].face_boundary.width,
+                    display_dim.width, 2000, 0);
 
              // bottom
             faces[i].rect[3] = faces[i].rect[1] +
-                MAP_TO_DRIVER_COORDINATE(fd_data->faces[i].face_boundary.height, display_dim.height, 2000, 0);
+                    MAP_TO_DRIVER_COORDINATE(
+                    detect_data->faces[i].face_boundary.height,
+                    display_dim.height, 2000, 0);
 
-            // Center of left eye
-            faces[i].left_eye[0] =
-                MAP_TO_DRIVER_COORDINATE(fd_data->faces[i].left_eye_center.x, display_dim.width, 2000, -1000);
+            LOGL("FD_DEBUG : Frame[%d] : Face[%d] : id=%d, score=%d, "
+                    "CAM[left=%d, top=%d, w=%d, h=%d], "
+                    "APP[left=%d, top=%d, right=%d, bottom=%d] ",
+                    detect_data->frame_id, i, faces[i].id, faces[i].score,
+                    detect_data->faces[i].face_boundary.left,
+                    detect_data->faces[i].face_boundary.top,
+                    detect_data->faces[i].face_boundary.width,
+                    detect_data->faces[i].face_boundary.height,
+                    faces[i].rect[0], faces[i].rect[1],
+                    faces[i].rect[2], faces[i].rect[3]);
 
-            faces[i].left_eye[1] =
-                MAP_TO_DRIVER_COORDINATE(fd_data->faces[i].left_eye_center.y, display_dim.height, 2000, -1000);
+            if (faces_data->landmark_valid) {
+                // Center of left eye
+                if (faces_data->landmark_data.face_landmarks[i].is_left_eye_valid) {
+                    faces[i].left_eye[0] = MAP_TO_DRIVER_COORDINATE(
+                            faces_data->landmark_data.face_landmarks[i].left_eye_center.x,
+                            display_dim.width, 2000, -1000);
+                    faces[i].left_eye[1] = MAP_TO_DRIVER_COORDINATE(
+                            faces_data->landmark_data.face_landmarks[i].left_eye_center.y,
+                            display_dim.height, 2000, -1000);
+                } else {
+                    faces[i].left_eye[0] = FACE_INVALID_POINT;
+                    faces[i].left_eye[1] = FACE_INVALID_POINT;
+                }
 
-            // Center of right eye
-            faces[i].right_eye[0] =
-                MAP_TO_DRIVER_COORDINATE(fd_data->faces[i].right_eye_center.x, display_dim.width, 2000, -1000);
+                // Center of right eye
+                if (faces_data->landmark_data.face_landmarks[i].is_right_eye_valid) {
+                    faces[i].right_eye[0] = MAP_TO_DRIVER_COORDINATE(
+                            faces_data->landmark_data.face_landmarks[i].right_eye_center.x,
+                            display_dim.width, 2000, -1000);
+                    faces[i].right_eye[1] = MAP_TO_DRIVER_COORDINATE(
+                            faces_data->landmark_data.face_landmarks[i].right_eye_center.y,
+                            display_dim.height, 2000, -1000);
+                } else {
+                    faces[i].right_eye[0] = FACE_INVALID_POINT;
+                    faces[i].right_eye[1] = FACE_INVALID_POINT;
+                }
 
-            faces[i].right_eye[1] =
-                MAP_TO_DRIVER_COORDINATE(fd_data->faces[i].right_eye_center.y, display_dim.height, 2000, -1000);
+                // Center of mouth
+                if (faces_data->landmark_data.face_landmarks[i].is_mouth_valid) {
+                    faces[i].mouth[0] = MAP_TO_DRIVER_COORDINATE(
+                            faces_data->landmark_data.face_landmarks[i].mouth_center.x,
+                            display_dim.width, 2000, -1000);
+                    faces[i].mouth[1] = MAP_TO_DRIVER_COORDINATE(
+                            faces_data->landmark_data.face_landmarks[i].mouth_center.y,
+                            display_dim.height, 2000, -1000);
+                } else {
+                    faces[i].mouth[0] = FACE_INVALID_POINT;
+                    faces[i].mouth[1] = FACE_INVALID_POINT;
+                }
 
-            // Center of mouth
-            faces[i].mouth[0] =
-                MAP_TO_DRIVER_COORDINATE(fd_data->faces[i].mouth_center.x, display_dim.width, 2000, -1000);
+                LOGL("FD_DEBUG LANDMARK : Frame[%d] : Face[%d] : "
+                        "eye : left(%d, %d) right(%d, %d), mouth(%d, %d)",
+                        detect_data->frame_id, i, faces[i].left_eye[0], faces[i].left_eye[1],
+                        faces[i].right_eye[0], faces[i].right_eye[1],
+                        faces[i].mouth[0], faces[i].mouth[1]);
+            } else {
+                // return -2000 if invalid
+                faces[i].left_eye[0] = FACE_INVALID_POINT;
+                faces[i].left_eye[1] = FACE_INVALID_POINT;
 
-            faces[i].mouth[1] =
-                MAP_TO_DRIVER_COORDINATE(fd_data->faces[i].mouth_center.y, display_dim.height, 2000, -1000);
+                faces[i].right_eye[0] = FACE_INVALID_POINT;
+                faces[i].right_eye[1] = FACE_INVALID_POINT;
+
+                faces[i].mouth[0] = FACE_INVALID_POINT;
+                faces[i].mouth[1] = FACE_INVALID_POINT;
+            }
 
 #ifndef VANILLA_HAL
 #ifdef TARGET_TS_MAKEUP
-            mFaceRect.left = fd_data->faces[i].face_boundary.left;
-            mFaceRect.top = fd_data->faces[i].face_boundary.top;
-            mFaceRect.right = fd_data->faces[i].face_boundary.width+mFaceRect.left;
-            mFaceRect.bottom = fd_data->faces[i].face_boundary.height+mFaceRect.top;
+            mFaceRect.left = detect_data->faces[i].face_boundary.left;
+            mFaceRect.top = detect_data->faces[i].face_boundary.top;
+            mFaceRect.right = detect_data->faces[i].face_boundary.width+mFaceRect.left;
+            mFaceRect.bottom = detect_data->faces[i].face_boundary.height+mFaceRect.top;
 #endif
-            faces[i].smile_degree = fd_data->faces[i].smile_degree;
-            faces[i].smile_score = fd_data->faces[i].smile_confidence;
-            faces[i].blink_detected = fd_data->faces[i].blink_detected;
-            faces[i].face_recognised = fd_data->faces[i].face_recognised;
-            faces[i].gaze_angle = fd_data->faces[i].gaze_angle;
+            if (faces_data->smile_valid) {
+                faces[i].smile_degree = faces_data->smile_data.smile[i].smile_degree;
+                faces[i].smile_score = faces_data->smile_data.smile[i].smile_confidence;
 
-            faces[i].updown_dir = fd_data->faces[i].updown_dir;
-            faces[i].leftright_dir = fd_data->faces[i].leftright_dir;
-            faces[i].roll_dir = fd_data->faces[i].roll_dir;
+                LOGL("FD_DEBUG LANDMARK : Frame[%d] : Face[%d] : smile_degree=%d, smile_score=%d",
+                        detect_data->frame_id, i, faces[i].smile_degree, faces[i].smile_score);
+            }
+            if (faces_data->blink_valid) {
+                faces[i].blink_detected = faces_data->blink_data.blink[i].blink_detected;
+                faces[i].leye_blink = faces_data->blink_data.blink[i].left_blink;
+                faces[i].reye_blink = faces_data->blink_data.blink[i].right_blink;
 
-            faces[i].leye_blink = fd_data->faces[i].left_blink;
-            faces[i].reye_blink = fd_data->faces[i].right_blink;
-            faces[i].left_right_gaze = fd_data->faces[i].left_right_gaze;
-            faces[i].top_bottom_gaze = fd_data->faces[i].top_bottom_gaze;
+                LOGL("FD_DEBUG LANDMARK : Frame[%d] : Face[%d] : "
+                        "blink_detected=%d, leye_blink=%d, reye_blink=%d",
+                        detect_data->frame_id, i, faces[i].blink_detected, faces[i].leye_blink,
+                        faces[i].reye_blink);
+            }
+            if (faces_data->recog_valid) {
+                faces[i].face_recognised = faces_data->recog_data.face_rec[i].face_recognised;
+
+                LOGL("FD_DEBUG LANDMARK : Frame[%d] : Face[%d] : face_recognised=%d",
+                        detect_data->frame_id, i, faces[i].face_recognised);
+            }
+            if (faces_data->gaze_valid) {
+                faces[i].gaze_angle = faces_data->gaze_data.gaze[i].gaze_angle;
+                faces[i].updown_dir = faces_data->gaze_data.gaze[i].updown_dir;
+                faces[i].leftright_dir = faces_data->gaze_data.gaze[i].leftright_dir;
+                faces[i].roll_dir = faces_data->gaze_data.gaze[i].roll_dir;
+                faces[i].left_right_gaze = faces_data->gaze_data.gaze[i].left_right_gaze;
+                faces[i].top_bottom_gaze = faces_data->gaze_data.gaze[i].top_bottom_gaze;
+
+                LOGL("FD_DEBUG LANDMARK : Frame[%d] : Face[%d] : gaze_angle=%d, updown_dir=%d, "
+                        "leftright_dir=%d,, roll_dir=%d, left_right_gaze=%d, top_bottom_gaze=%d",
+                        detect_data->frame_id, i, faces[i].gaze_angle, faces[i].updown_dir,
+                        faces[i].leftright_dir, faces[i].roll_dir, faces[i].left_right_gaze,
+                        faces[i].top_bottom_gaze);
+            }
 #endif
 
         }
@@ -8010,7 +9879,7 @@ int32_t QCamera2HardwareInterface::processFaceDetectionResult(cam_face_detection
     cbArg.release_cb = releaseCameraMemory;
     int32_t rc = m_cbNotifier.notifyCallback(cbArg);
     if (rc != NO_ERROR) {
-        ALOGE("%s: fail sending notification", __func__);
+        LOGE("fail sending notification");
         faceResultBuffer->release(faceResultBuffer);
     }
 
@@ -8060,7 +9929,7 @@ void QCamera2HardwareInterface::returnStreamBuffer(void *data,
     if ((NULL != stream) && (0 <= idx)) {
         stream->bufDone((uint32_t)idx);
     } else {
-        ALOGE("%s: Cannot return buffer %d %p", __func__, idx, cookie);
+        LOGE("Cannot return buffer %d %p", idx, cookie);
     }
 }
 
@@ -8076,11 +9945,12 @@ void QCamera2HardwareInterface::returnStreamBuffer(void *data,
  *              NO_ERROR  -- success
  *              none-zero failure code
  *==========================================================================*/
-int32_t QCamera2HardwareInterface::processHistogramStats(cam_hist_stats_t &stats_data)
+int32_t QCamera2HardwareInterface::processHistogramStats(
+        __unused cam_hist_stats_t &stats_data)
 {
 #ifndef VANILLA_HAL
     if (!mParameters.isHistogramEnabled()) {
-        CDBG_HIGH("%s: Histogram not enabled, no ops here", __func__);
+        LOGH("Histogram not enabled, no ops here");
         return NO_ERROR;
     }
 
@@ -8089,20 +9959,37 @@ int32_t QCamera2HardwareInterface::processHistogramStats(cam_hist_stats_t &stats
                                              1,
                                              mCallbackCookie);
     if ( NULL == histBuffer ) {
-        ALOGE("%s: Not enough memory for histogram data",
-              __func__);
+        LOGE("Not enough memory for histogram data");
         return NO_MEMORY;
     }
 
     cam_histogram_data_t *pHistData = (cam_histogram_data_t *)histBuffer->data;
     if (pHistData == NULL) {
-        ALOGE("%s: memory data ptr is NULL", __func__);
+        LOGE("memory data ptr is NULL");
         return UNKNOWN_ERROR;
     }
 
     switch (stats_data.type) {
     case CAM_HISTOGRAM_TYPE_BAYER:
-        *pHistData = stats_data.bayer_stats.gb_stats;
+        switch (stats_data.bayer_stats.data_type) {
+            case CAM_STATS_CHANNEL_Y:
+            case CAM_STATS_CHANNEL_R:
+                *pHistData = stats_data.bayer_stats.r_stats;
+                break;
+            case CAM_STATS_CHANNEL_GR:
+                *pHistData = stats_data.bayer_stats.gr_stats;
+                break;
+            case CAM_STATS_CHANNEL_GB:
+            case CAM_STATS_CHANNEL_ALL:
+                *pHistData = stats_data.bayer_stats.gb_stats;
+                break;
+            case CAM_STATS_CHANNEL_B:
+                *pHistData = stats_data.bayer_stats.b_stats;
+                break;
+            default:
+                *pHistData = stats_data.bayer_stats.r_stats;
+                break;
+        }
         break;
     case CAM_HISTOGRAM_TYPE_YUV:
         *pHistData = stats_data.yuv_stats;
@@ -8119,7 +10006,7 @@ int32_t QCamera2HardwareInterface::processHistogramStats(cam_hist_stats_t &stats
     cbArg.release_cb = releaseCameraMemory;
     int32_t rc = m_cbNotifier.notifyCallback(cbArg);
     if (rc != NO_ERROR) {
-        ALOGE("%s: fail sending notification", __func__);
+        LOGE("fail sending notification");
         histBuffer->release(histBuffer);
     }
 #endif
@@ -8131,13 +10018,19 @@ int32_t QCamera2HardwareInterface::processHistogramStats(cam_hist_stats_t &stats
  *
  * DESCRIPTION: Calculates the target fps range depending on
  *              the thermal level.
+ *              Note that this function can be called from QCameraParametersIntf
+ *              while mutex is held. So it should not call back into
+ *              QCameraParametersIntf causing deadlock.
  *
  * PARAMETERS :
- *   @level    : received thermal level
- *   @minFPS   : minimum configured fps range
- *   @maxFPS   : maximum configured fps range
+ *   @level      : received thermal level
+ *   @minFPS     : minimum configured fps range
+ *   @maxFPS     : maximum configured fps range
+ *   @minVideoFps: minimum configured fps range
+ *   @maxVideoFps: maximum configured fps range
  *   @adjustedRange : target fps range
  *   @skipPattern : target skip pattern
+ *   @bRecordingHint : recording hint value
  *
  * RETURN     : int32_t type of status
  *              NO_ERROR  -- success
@@ -8147,25 +10040,18 @@ int QCamera2HardwareInterface::calcThermalLevel(
             qcamera_thermal_level_enum_t level,
             const int minFPSi,
             const int maxFPSi,
+            const float &minVideoFps,
+            const float &maxVideoFps,
             cam_fps_range_t &adjustedRange,
-            enum msm_vfe_frame_skip_pattern &skipPattern)
+            enum msm_vfe_frame_skip_pattern &skipPattern,
+            bool bRecordingHint)
 {
     const float minFPS = (float)minFPSi;
     const float maxFPS = (float)maxFPSi;
 
-    // Initialize video fps to preview fps
-    float minVideoFps = minFPS, maxVideoFps = maxFPS;
-    cam_fps_range_t videoFps;
-    // If HFR mode, update video fps accordingly
-    if(isHFRMode()) {
-        mParameters.getHfrFps(videoFps);
-        minVideoFps = videoFps.video_min_fps;
-        maxVideoFps = videoFps.video_max_fps;
-    }
-
-    CDBG_HIGH("%s: level: %d, preview minfps %f, preview maxfpS %f, "
+    LOGH("level: %d, preview minfps %f, preview maxfpS %f, "
               "video minfps %f, video maxfpS %f",
-            __func__, level, minFPS, maxFPS, minVideoFps, maxVideoFps);
+             level, minFPS, maxFPS, minVideoFps, maxVideoFps);
 
     switch(level) {
     case QCAMERA_THERMAL_NO_ADJUSTMENT:
@@ -8252,29 +10138,29 @@ int QCamera2HardwareInterface::calcThermalLevel(
     case QCAMERA_THERMAL_SHUTDOWN:
         {
             // send error notify
-            ALOGE("%s: Received shutdown thermal level. Closing camera", __func__);
+            LOGE("Received shutdown thermal level. Closing camera");
             sendEvtNotify(CAMERA_MSG_ERROR, CAMERA_ERROR_SERVER_DIED, 0);
         }
         break;
     default:
         {
-            ALOGE("%s: Invalid thermal level %d", __func__, level);
+            LOGW("Invalid thermal level %d", level);
             return BAD_VALUE;
         }
         break;
     }
     if (level >= QCAMERA_THERMAL_NO_ADJUSTMENT && level <= QCAMERA_THERMAL_MAX_ADJUSTMENT) {
-        if (mParameters.getRecordingHintValue() == true) {
+        if (bRecordingHint) {
             adjustedRange.min_fps = minFPS / 1000.0f;
             adjustedRange.max_fps = maxFPS / 1000.0f;
             adjustedRange.video_min_fps = minVideoFps / 1000.0f;
             adjustedRange.video_max_fps = maxVideoFps / 1000.0f;
             skipPattern = NO_SKIP;
-            CDBG_HIGH("%s: No FPS mitigation in camcorder mode", __func__);
+            LOGH("No FPS mitigation in camcorder mode");
         }
-        CDBG_HIGH("%s: Thermal level %d, FPS [%3.2f,%3.2f, %3.2f,%3.2f], frameskip %d",
-                __func__, level, adjustedRange.min_fps, adjustedRange.max_fps,
-                adjustedRange.video_min_fps, adjustedRange.video_max_fps,skipPattern);
+        LOGH("Thermal level %d, FPS [%3.2f,%3.2f, %3.2f,%3.2f], frameskip %d",
+                  level, adjustedRange.min_fps, adjustedRange.max_fps,
+                    adjustedRange.video_min_fps, adjustedRange.video_max_fps, skipPattern);
     }
 
     return NO_ERROR;
@@ -8287,23 +10173,30 @@ int QCamera2HardwareInterface::calcThermalLevel(
  *              the last thermal level.
  *
  * PARAMETERS :
- *   @minFPS   : minimum configured fps range
- *   @maxFPS   : maximum configured fps range
+ *   @minFPS      : minimum configured fps range
+ *   @maxFPS      : maximum configured fps range
+ *   @minVideoFPS : minimum configured video fps
+ *   @maxVideoFPS : maximum configured video fps
  *   @adjustedRange : target fps range
+ *   @bRecordingHint : recording hint value
  *
  * RETURN     : int32_t type of status
  *              NO_ERROR  -- success
  *              none-zero failure code
  *==========================================================================*/
 int QCamera2HardwareInterface::recalcFPSRange(int &minFPS, int &maxFPS,
-        cam_fps_range_t &adjustedRange)
+        const float &minVideoFPS, const float &maxVideoFPS,
+        cam_fps_range_t &adjustedRange, bool bRecordingHint)
 {
     enum msm_vfe_frame_skip_pattern skipPattern;
     calcThermalLevel(mThermalLevel,
                      minFPS,
                      maxFPS,
+                     minVideoFPS,
+                     maxVideoFPS,
                      adjustedRange,
-                     skipPattern);
+                     skipPattern,
+                     bRecordingHint);
     return NO_ERROR;
 }
 
@@ -8324,20 +10217,32 @@ int QCamera2HardwareInterface::updateThermalLevel(void *thermal_level)
     int ret = NO_ERROR;
     cam_fps_range_t adjustedRange;
     int minFPS, maxFPS;
+    float minVideoFPS, maxVideoFPS;
     enum msm_vfe_frame_skip_pattern skipPattern;
+    bool value;
     qcamera_thermal_level_enum_t level = *(qcamera_thermal_level_enum_t *)thermal_level;
 
-    pthread_mutex_lock(&m_parm_lock);
 
     if (!mCameraOpened) {
-        CDBG_HIGH("%s: Camera is not opened, no need to update camera parameters", __func__);
-        pthread_mutex_unlock(&m_parm_lock);
+        LOGH("Camera is not opened, no need to update camera parameters");
         return NO_ERROR;
     }
 
     mParameters.getPreviewFpsRange(&minFPS, &maxFPS);
     qcamera_thermal_mode thermalMode = mParameters.getThermalMode();
-    calcThermalLevel(level, minFPS, maxFPS, adjustedRange, skipPattern);
+    if (mParameters.isHfrMode()) {
+        cam_fps_range_t hfrFpsRange;
+        mParameters.getHfrFps(hfrFpsRange);
+        minVideoFPS = hfrFpsRange.video_min_fps;
+        maxVideoFPS = hfrFpsRange.video_max_fps;
+    } else {
+        minVideoFPS = minFPS;
+        maxVideoFPS = maxFPS;
+    }
+
+    value = mParameters.getRecordingHintValue();
+    calcThermalLevel(level, minFPS, maxFPS, minVideoFPS, maxVideoFPS,
+            adjustedRange, skipPattern, value );
     mThermalLevel = level;
 
     if (thermalMode == QCAMERA_THERMAL_ADJUST_FPS)
@@ -8345,10 +10250,23 @@ int QCamera2HardwareInterface::updateThermalLevel(void *thermal_level)
     else if (thermalMode == QCAMERA_THERMAL_ADJUST_FRAMESKIP)
         ret = mParameters.setFrameSkip(skipPattern);
     else
-        ALOGE("%s: Incorrect thermal mode %d", __func__, thermalMode);
+        LOGW("Incorrect thermal mode %d", thermalMode);
 
-    pthread_mutex_unlock(&m_parm_lock);
-
+    if (isDualCamera()) {
+        bool enable = false;
+        // Provide the thermal level to FOV-control
+        if ((mThermalLevel >= QCAMERA_THERMAL_SLIGHT_ADJUSTMENT) &&
+                (mThermalLevel <= QCAMERA_THERMAL_MAX_ADJUSTMENT)) {
+            enable = true;
+            m_pFovControl->UpdateFlag(FOVCONTROL_FLAG_THERMAL_THROTTLE, &enable);
+        } else if (mThermalLevel == QCAMERA_THERMAL_NO_ADJUSTMENT) {
+            enable = false;
+            m_pFovControl->UpdateFlag(FOVCONTROL_FLAG_THERMAL_THROTTLE, &enable);
+        }
+        if (m_bFirstPreviewFrameReceived) {
+            processDualCamFovControl();
+        }
+    }
     return ret;
 
 }
@@ -8370,10 +10288,9 @@ int QCamera2HardwareInterface::updateParameters(const char *parms, bool &needRes
 {
     int rc = NO_ERROR;
 
-    pthread_mutex_lock(&m_parm_lock);
     String8 str = String8(parms);
-    QCameraParameters param(str);
-    rc =  mParameters.updateParameters(param, needRestart);
+    rc =  mParameters.updateParameters(str, needRestart);
+    setNeedRestart(needRestart);
 
     // update stream based parameter settings
     for (int i = 0; i < QCAMERA_CH_TYPE_MAX; i++) {
@@ -8381,7 +10298,6 @@ int QCamera2HardwareInterface::updateParameters(const char *parms, bool &needRes
             m_channels[i]->UpdateStreamBasedParameters(mParameters);
         }
     }
-    pthread_mutex_unlock(&m_parm_lock);
 
     return rc;
 }
@@ -8402,13 +10318,19 @@ int QCamera2HardwareInterface::updateParameters(const char *parms, bool &needRes
 int QCamera2HardwareInterface::commitParameterChanges()
 {
     int rc = NO_ERROR;
-    pthread_mutex_lock(&m_parm_lock);
     rc = mParameters.commitParameters();
     if (rc == NO_ERROR) {
         // update number of snapshot based on committed parameters setting
         rc = mParameters.setNumOfSnapshot();
     }
-    pthread_mutex_unlock(&m_parm_lock);
+
+    if (isDualCamera() &&
+        mParameters.isZoomChanged()) {
+        // If zoom changes, get the updated FOV-control result and if needed send the dual
+        // camera parameters to backend
+        LOGD("processDualCamFovControl: zoom changed");
+        processDualCamFovControl();
+    }
     return rc;
 }
 
@@ -8425,9 +10347,7 @@ int QCamera2HardwareInterface::commitParameterChanges()
 bool QCamera2HardwareInterface::needDebugFps()
 {
     bool needFps = false;
-    pthread_mutex_lock(&m_parm_lock);
     needFps = mParameters.isFpsDebugEnabled();
-    pthread_mutex_unlock(&m_parm_lock);
     return needFps;
 }
 
@@ -8445,7 +10365,7 @@ bool QCamera2HardwareInterface::isCACEnabled()
 {
     char prop[PROPERTY_VALUE_MAX];
     memset(prop, 0, sizeof(prop));
-    property_get("persist.camera.feature.cac", prop, "0");
+    property_get("persist.vendor.camera.feature.cac", prop, "0");
     int enableCAC = atoi(prop);
     return enableCAC == 1;
 }
@@ -8485,7 +10405,7 @@ bool QCamera2HardwareInterface::isPreviewRestartEnabled()
 {
     char prop[PROPERTY_VALUE_MAX];
     memset(prop, 0, sizeof(prop));
-    property_get("persist.camera.feature.restart", prop, "0");
+    property_get("persist.vendor.camera.feature.restart", prop, "0");
     int earlyRestart = atoi(prop);
     return earlyRestart == 1;
 }
@@ -8503,19 +10423,21 @@ bool QCamera2HardwareInterface::isPreviewRestartEnabled()
 bool QCamera2HardwareInterface::needReprocess()
 {
     bool needReprocess = false;
-    pthread_mutex_lock(&m_parm_lock);
 
     if (!mParameters.isJpegPictureFormat() &&
         !mParameters.isNV21PictureFormat()) {
         // RAW image, no need to reprocess
-        pthread_mutex_unlock(&m_parm_lock);
         return false;
     }
 
-    //Disable reprocess for 4K liveshot case but enable if lowpower mode
-    if (mParameters.is4k2kVideoResolution() && mParameters.getRecordingHintValue()
-            && !isLowPowerMode()) {
-        pthread_mutex_unlock(&m_parm_lock);
+    if (isSecureMode() && isRdiMode()) {
+        // RDI in secure mode -> RAW image, no need to reprocess
+        return false;
+    }
+
+    //Disable reprocess for small jpeg size or 4K liveshot case but enable if lowpower mode
+    if ((mParameters.is4k2kVideoResolution() && mParameters.getRecordingHintValue()
+            && !isLowPowerMode()) || mParameters.isSmallJpegSizeEnabled()) {
         return false;
     }
 
@@ -8525,14 +10447,13 @@ bool QCamera2HardwareInterface::needReprocess()
 
     //Decide whether to do reprocess or not based on
     //ppconfig obtained in the first pass.
-    getPPConfig(pp_config, 1);
+    getPPConfig(pp_config);
 
     if (pp_config.feature_mask > 0) {
         needReprocess = true;
     }
 
-    CDBG_HIGH("%s: needReprocess %s", __func__, needReprocess ? "true" : "false");
-    pthread_mutex_unlock(&m_parm_lock);
+    LOGH("needReprocess %s", needReprocess ? "true" : "false");
     return needReprocess;
 }
 
@@ -8549,33 +10470,28 @@ bool QCamera2HardwareInterface::needReprocess()
  *==========================================================================*/
 bool QCamera2HardwareInterface::needRotationReprocess()
 {
-    pthread_mutex_lock(&m_parm_lock);
     if (!mParameters.isJpegPictureFormat() &&
         !mParameters.isNV21PictureFormat()) {
         // RAW image, no need to reprocess
-        pthread_mutex_unlock(&m_parm_lock);
         return false;
     }
 
     //Disable reprocess for 4K liveshot case
-    if (mParameters.is4k2kVideoResolution() && mParameters.getRecordingHintValue()
-            && !isLowPowerMode()) {
-        //Disable reprocess for 4K liveshot case
-        pthread_mutex_unlock(&m_parm_lock);
-        return false;
+    if ((mParameters.is4k2kVideoResolution() && mParameters.getRecordingHintValue()
+            && !isLowPowerMode()) || mParameters.isSmallJpegSizeEnabled()) {
+        //Disable reprocess for 4K liveshot case or small jpeg size
+         return false;
     }
 
     if ((gCamCapability[mCameraId]->qcom_supported_feature_mask &
             CAM_QCOM_FEATURE_ROTATION) > 0 &&
             (mParameters.getJpegRotation() > 0)) {
         // current rotation is not zero, and pp has the capability to process rotation
-        CDBG_HIGH("%s: need to do reprocess for rotation=%d",
-                __func__, mParameters.getJpegRotation());
-        pthread_mutex_unlock(&m_parm_lock);
+        LOGH("need to do reprocess for rotation=%d",
+                 mParameters.getJpegRotation());
         return true;
     }
 
-    pthread_mutex_unlock(&m_parm_lock);
     return false;
 }
 
@@ -8591,9 +10507,7 @@ bool QCamera2HardwareInterface::needRotationReprocess()
  *==========================================================================*/
 void QCamera2HardwareInterface::getThumbnailSize(cam_dimension_t &dim)
 {
-    pthread_mutex_lock(&m_parm_lock);
     mParameters.getThumbnailSize(&dim.width, &dim.height);
-    pthread_mutex_unlock(&m_parm_lock);
 }
 
 /*===========================================================================
@@ -8608,9 +10522,7 @@ void QCamera2HardwareInterface::getThumbnailSize(cam_dimension_t &dim)
 uint32_t QCamera2HardwareInterface::getJpegQuality()
 {
     uint32_t quality = 0;
-    pthread_mutex_lock(&m_parm_lock);
     quality =  mParameters.getJpegQuality();
-    pthread_mutex_unlock(&m_parm_lock);
     return quality;
 }
 
@@ -8627,16 +10539,14 @@ QCameraExif *QCamera2HardwareInterface::getExifData()
 {
     QCameraExif *exif = new QCameraExif();
     if (exif == NULL) {
-        ALOGE("%s: No memory for QCameraExif", __func__);
+        LOGE("No memory for QCameraExif");
         return NULL;
     }
 
     int32_t rc = NO_ERROR;
 
-    pthread_mutex_lock(&m_parm_lock);
-
     // add exif entries
-    String8 dateTime(""), subSecTime("");
+    String8 dateTime, subSecTime;
     rc = mParameters.getExifDateTime(dateTime, subSecTime);
     if(rc == NO_ERROR) {
         exif->addEntry(EXIFTAGID_DATE_TIME, EXIF_ASCII,
@@ -8652,7 +10562,7 @@ QCameraExif *QCamera2HardwareInterface::getExifData()
         exif->addEntry(EXIFTAGID_SUBSEC_TIME_DIGITIZED, EXIF_ASCII,
                 (uint32_t)(subSecTime.length() + 1), (void *)subSecTime.string());
     } else {
-        ALOGE("%s: getExifDateTime failed", __func__);
+        LOGW("getExifDateTime failed");
     }
 
     rat_t focalLength;
@@ -8663,7 +10573,7 @@ QCameraExif *QCamera2HardwareInterface::getExifData()
                        1,
                        (void *)&(focalLength));
     } else {
-        ALOGE("%s: getExifFocalLength failed", __func__);
+        LOGW("getExifFocalLength failed");
     }
 
     uint16_t isoSpeed = mParameters.getExifIsoSpeed();
@@ -8676,6 +10586,8 @@ QCameraExif *QCamera2HardwareInterface::getExifData()
 
     char gpsProcessingMethod[EXIF_ASCII_PREFIX_SIZE + GPS_PROCESSING_METHOD_SIZE];
     uint32_t count = 0;
+
+    /*gps data might not be available */
     rc = mParameters.getExifGpsProcessingMethod(gpsProcessingMethod, count);
     if(rc == NO_ERROR) {
         exif->addEntry(EXIFTAGID_GPS_PROCESSINGMETHOD,
@@ -8683,7 +10595,7 @@ QCameraExif *QCamera2HardwareInterface::getExifData()
                        count,
                        (void *)gpsProcessingMethod);
     } else {
-        ALOGE("%s: getExifGpsProcessingMethod failed", __func__);
+        LOGW("getExifGpsProcessingMethod failed");
     }
 
     rat_t latitude[3];
@@ -8699,7 +10611,7 @@ QCameraExif *QCamera2HardwareInterface::getExifData()
                        2,
                        (void *)latRef);
     } else {
-        ALOGE("%s: getExifLatitude failed", __func__);
+        LOGW("getExifLatitude failed");
     }
 
     rat_t longitude[3];
@@ -8716,7 +10628,7 @@ QCameraExif *QCamera2HardwareInterface::getExifData()
                        2,
                        (void *)lonRef);
     } else {
-        ALOGE("%s: getExifLongitude failed", __func__);
+        LOGW("getExifLongitude failed");
     }
 
     rat_t altitude;
@@ -8733,7 +10645,7 @@ QCameraExif *QCamera2HardwareInterface::getExifData()
                        1,
                        (void *)&altRef);
     } else {
-        ALOGE("%s: getExifAltitude failed", __func__);
+        LOGW("getExifAltitude failed");
     }
 
     char gpsDateStamp[20];
@@ -8750,32 +10662,36 @@ QCameraExif *QCamera2HardwareInterface::getExifData()
                        3,
                        (void *)gpsTimeStamp);
     } else {
-        ALOGE("%s: getExifGpsDataTimeStamp failed", __func__);
+        LOGW("getExifGpsDataTimeStamp failed");
     }
 
+#ifdef ENABLE_MODEL_INFO_EXIF
+
     char value[PROPERTY_VALUE_MAX];
-    if (property_get("persist.sys.exif.make", value, "") > 0 ||
+    if (property_get("persist.vendor.sys.exif.make", value, "") > 0 ||
             property_get("ro.product.manufacturer", value, "QCOM-AA") > 0) {
         exif->addEntry(EXIFTAGID_MAKE,
                 EXIF_ASCII, strlen(value) + 1, (void *)value);
     } else {
-        ALOGE("%s: getExifMaker failed", __func__);
+        LOGW("getExifMaker failed");
     }
 
-    if (property_get("persist.sys.exif.model", value, "") > 0 ||
+    if (property_get("persist.vendor.sys.exif.model", value, "") > 0 ||
             property_get("ro.product.model", value, "QCAM-AA") > 0) {
         exif->addEntry(EXIFTAGID_MODEL,
                 EXIF_ASCII, strlen(value) + 1, (void *)value);
     } else {
-        ALOGE("%s: getExifModel failed", __func__);
+        LOGW("getExifModel failed");
     }
 
     if (property_get("ro.build.description", value, "QCAM-AA") > 0) {
         exif->addEntry(EXIFTAGID_SOFTWARE, EXIF_ASCII,
                 (uint32_t)(strlen(value) + 1), (void *)value);
     } else {
-        ALOGE("%s: getExifSoftware failed", __func__);
+        LOGW("getExifSoftware failed");
     }
+
+#endif
 
     if (mParameters.useJpegExifRotation()) {
         int16_t orientation;
@@ -8806,7 +10722,6 @@ QCameraExif *QCamera2HardwareInterface::getExifData()
                 (void *)&orientation);
     }
 
-    pthread_mutex_unlock(&m_parm_lock);
     return exif;
 }
 
@@ -8824,11 +10739,7 @@ QCameraExif *QCamera2HardwareInterface::getExifData()
  *==========================================================================*/
 int32_t QCamera2HardwareInterface::setHistogram(bool histogram_en)
 {
-    int32_t rc = NO_ERROR;
-    pthread_mutex_lock(&m_parm_lock);
-    rc = mParameters.setHistogram(histogram_en);
-    pthread_mutex_unlock(&m_parm_lock);
-    return rc;
+    return mParameters.setHistogram(histogram_en);
 }
 
 /*===========================================================================
@@ -8845,11 +10756,7 @@ int32_t QCamera2HardwareInterface::setHistogram(bool histogram_en)
  *==========================================================================*/
 int32_t QCamera2HardwareInterface::setFaceDetection(bool enabled)
 {
-    int32_t rc = NO_ERROR;
-    pthread_mutex_lock(&m_parm_lock);
-    rc = mParameters.setFaceDetection(enabled, true);
-    pthread_mutex_unlock(&m_parm_lock);
-    return rc;
+    return mParameters.setFaceDetection(enabled, true);
 }
 
 /*===========================================================================
@@ -8867,7 +10774,7 @@ bool QCamera2HardwareInterface::isCaptureShutterEnabled()
 {
     char prop[PROPERTY_VALUE_MAX];
     memset(prop, 0, sizeof(prop));
-    property_get("persist.camera.feature.shutter", prop, "0");
+    property_get("persist.vendor.camera.feature.shutter", prop, "0");
     int enableShutter = atoi(prop);
     return enableShutter == 1;
 }
@@ -8878,17 +10785,19 @@ bool QCamera2HardwareInterface::isCaptureShutterEnabled()
  * DESCRIPTION: returns whether preview frame need to be displayed
  *
  * PARAMETERS :
+ *   @frameID : frameID of frame to be processed
  *
  * RETURN     : int32_t type of status
  *              NO_ERROR  -- success
  *              none-zero failure code
  *==========================================================================*/
-bool QCamera2HardwareInterface::needProcessPreviewFrame()
+bool QCamera2HardwareInterface::needProcessPreviewFrame(uint32_t frameID)
 {
-    return m_stateMachine.isPreviewRunning()
-            && mParameters.isDisplayFrameNeeded()
-            && !mParameters.isInstantAECEnabled();
-};
+    return (((m_stateMachine.isPreviewRunning()) &&
+            (!isDisplayFrameToSkip(frameID)) &&
+            (!mParameters.isInstantAECEnabled())) ||
+            (isPreviewRestartEnabled()));
+}
 
 /*===========================================================================
  * FUNCTION   : needSendPreviewCallback
@@ -8897,7 +10806,7 @@ bool QCamera2HardwareInterface::needProcessPreviewFrame()
  *
  * PARAMETERS :
  *
- *  RETURN     : true - need preview frame callbck
+ * RETURN     : true - need preview frame callbck
  *              false - not send preview frame callback
  *==========================================================================*/
 bool QCamera2HardwareInterface::needSendPreviewCallback()
@@ -8905,8 +10814,102 @@ bool QCamera2HardwareInterface::needSendPreviewCallback()
     return m_stateMachine.isPreviewRunning()
             && (mDataCb != NULL)
             && (msgTypeEnabledWithLock(CAMERA_MSG_PREVIEW_FRAME) > 0)
-            && mParameters.isPreviewCallbackNeeded();
+            && m_stateMachine.isPreviewCallbackNeeded();
 };
+
+/*===========================================================================
+ * FUNCTION   : setDisplaySkip
+ *
+ * DESCRIPTION: set range of frames to skip for preview
+ *
+ * PARAMETERS :
+ *   @enabled : TRUE to start skipping frame to display
+                FALSE to stop skipping frame to display
+ *   @skipCnt : Number of frame to skip. 0 by default
+ *
+ * RETURN     : None
+ *==========================================================================*/
+void QCamera2HardwareInterface::setDisplaySkip(bool enabled, uint8_t skipCnt)
+{
+    pthread_mutex_lock(&mGrallocLock);
+    if (enabled) {
+        setDisplayFrameSkip();
+        setDisplayFrameSkip(mLastPreviewFrameID + skipCnt + 1);
+    } else {
+        setDisplayFrameSkip(mFrameSkipStart, (mLastPreviewFrameID + skipCnt + 1));
+    }
+    pthread_mutex_unlock(&mGrallocLock);
+}
+
+/*===========================================================================
+ * FUNCTION   : setDisplayFrameSkip
+ *
+ * DESCRIPTION: set range of frames to skip for preview
+ *
+ * PARAMETERS :
+ *   @start   : frameId to start skip
+ *   @end     : frameId to stop skip
+ *
+ * RETURN     : None
+ *==========================================================================*/
+void QCamera2HardwareInterface::setDisplayFrameSkip(uint32_t start,
+        uint32_t end)
+{
+    if (start == 0) {
+        mFrameSkipStart = 0;
+        mFrameSkipEnd = 0;
+        return;
+    }
+    if ((mFrameSkipStart == 0) || (mFrameSkipStart > start)) {
+        mFrameSkipStart = start;
+    }
+    if ((end == 0) || (end > mFrameSkipEnd)) {
+        mFrameSkipEnd = end;
+    }
+}
+
+/*===========================================================================
+ * FUNCTION   : isDisplayFrameToSkip
+ *
+ * DESCRIPTION: function to determin if input frame falls under skip range
+ *
+ * PARAMETERS :
+ *   @frameId : frameId to verify
+ *
+ * RETURN     : true : need to skip
+ *              false: no need to skip
+ *==========================================================================*/
+bool QCamera2HardwareInterface::isDisplayFrameToSkip(uint32_t frameId)
+{
+    return ((mFrameSkipStart != 0) && (frameId >= mFrameSkipStart) &&
+            (frameId <= mFrameSkipEnd || mFrameSkipEnd == 0)) ? TRUE : FALSE;
+}
+
+/*===========================================================================
+ * FUNCTION   : getSnapshotHandle
+ *
+ * DESCRIPTION: Get the camera handle for snapshot based on the bundlesnapshot
+ *              flag and active camera state
+ *
+ * PARAMETERS : None
+ *
+ * RETURN     : camera handle for snapshot
+ *
+ *==========================================================================*/
+uint32_t QCamera2HardwareInterface::getSnapshotHandle()
+{
+    uint32_t snapshotHandle = 0;
+
+    if ((mActiveCameras == MM_CAMERA_DUAL_CAM) && mBundledSnapshot) {
+        snapshotHandle = mCameraHandle->camera_handle;
+    } else {
+        snapshotHandle = (mMasterCamera == MM_CAMERA_TYPE_MAIN) ?
+                get_main_camera_handle(mCameraHandle->camera_handle) :
+                get_aux_camera_handle(mCameraHandle->camera_handle);
+    }
+
+    return snapshotHandle;
+}
 
 /*===========================================================================
  * FUNCTION   : prepareHardwareForSnapshot
@@ -8922,9 +10925,9 @@ bool QCamera2HardwareInterface::needSendPreviewCallback()
  *==========================================================================*/
 int32_t QCamera2HardwareInterface::prepareHardwareForSnapshot(int32_t afNeeded)
 {
-    ATRACE_CALL();
-    CDBG_HIGH("[KPI Perf] %s: Prepare hardware such as LED",__func__);
-    return mCameraHandle->ops->prepare_snapshot(mCameraHandle->camera_handle,
+    ATRACE_CAMSCOPE_CALL(CAMSCOPE_HAL1_PREPARE_HW_FOR_SNAPSHOT);
+    LOGI("[KPI Perf]: Send PREPARE SANSPHOT event");
+    return mCameraHandle->ops->prepare_snapshot(getSnapshotHandle(),
                                                 afNeeded);
 }
 
@@ -8948,7 +10951,7 @@ bool QCamera2HardwareInterface::needFDMetadata(qcamera_ch_type_enum_t channel_ty
         if(mParameters.isSnapshotFDNeeded() &&
            mParameters.isFaceDetectionEnabled()){
             value = true;
-            CDBG_HIGH("%s: Face Detection metadata is required in ZSL mode.", __func__);
+            LOGH("Face Detection metadata is required in ZSL mode.");
         }
     }
 
@@ -8970,6 +10973,7 @@ void *QCamera2HardwareInterface::deferredWorkRoutine(void *obj)
     int running = 1;
     int ret;
     uint8_t is_active = FALSE;
+    int32_t job_status = 0;
 
     QCamera2HardwareInterface *pme = (QCamera2HardwareInterface *)obj;
     QCameraCmdThread *cmdThread = &pme->mDeferredWorkThread;
@@ -8979,21 +10983,22 @@ void *QCamera2HardwareInterface::deferredWorkRoutine(void *obj)
         do {
             ret = cam_sem_wait(&cmdThread->cmd_sem);
             if (ret != 0 && errno != EINVAL) {
-                ALOGE("%s: cam_sem_wait error (%s)",
-                        __func__, strerror(errno));
+                LOGE("cam_sem_wait error (%s)",
+                         strerror(errno));
                 return NULL;
             }
         } while (ret != 0);
 
         // we got notified about new cmd avail in cmd queue
         camera_cmd_type_t cmd = cmdThread->getCmd();
+        LOGD("cmd: %d", cmd);
         switch (cmd) {
         case CAMERA_CMD_TYPE_START_DATA_PROC:
-            CDBG_HIGH("%s: start data proc", __func__);
+            LOGH("start data proc");
             is_active = TRUE;
             break;
         case CAMERA_CMD_TYPE_STOP_DATA_PROC:
-            CDBG_HIGH("%s: stop data proc", __func__);
+            LOGH("stop data proc");
             is_active = FALSE;
             // signal cmd is completed
             cam_sem_post(&cmdThread->sync_sem);
@@ -9004,7 +11009,7 @@ void *QCamera2HardwareInterface::deferredWorkRoutine(void *obj)
                     reinterpret_cast<DefWork *>(pme->mCmdQueue.dequeue());
 
                 if ( NULL == dw ) {
-                    ALOGE("%s : Invalid deferred work", __func__);
+                    LOGE("Invalid deferred work");
                     break;
                 }
 
@@ -9014,14 +11019,14 @@ void *QCamera2HardwareInterface::deferredWorkRoutine(void *obj)
                         QCameraChannel * pChannel = dw->args.allocArgs.ch;
 
                         if ( NULL == pChannel ) {
-                            ALOGE("%s : Invalid deferred work channel",
-                                    __func__);
+                            LOGE("Invalid deferred work channel");
+                            job_status = BAD_VALUE;
                             break;
                         }
 
                         cam_stream_type_t streamType = dw->args.allocArgs.type;
-                        CDBG_HIGH("%s: Deferred buffer allocation started for stream type: %d",
-                                __func__, streamType);
+                        LOGH("Deferred buffer allocation started for stream type: %d",
+                                 streamType);
 
                         uint32_t iNumOfStreams = pChannel->getNumOfStreams();
                         QCameraStream *pStream = NULL;
@@ -9029,13 +11034,16 @@ void *QCamera2HardwareInterface::deferredWorkRoutine(void *obj)
                             pStream = pChannel->getStreamByIndex(i);
 
                             if ( NULL == pStream ) {
+                                job_status = BAD_VALUE;
                                 break;
                             }
 
                             if ( pStream->isTypeOf(streamType)) {
                                 if ( pStream->allocateBuffers() ) {
-                                    ALOGE("%s: Error allocating buffers !!!",
-                                            __func__);
+                                    LOGE("Error allocating buffers !!!");
+                                    job_status =  NO_MEMORY;
+                                    pme->sendEvtNotify(CAMERA_MSG_ERROR,
+                                            CAMERA_ERROR_UNKNOWN, 0);
                                 }
                                 break;
                             }
@@ -9044,28 +11052,47 @@ void *QCamera2HardwareInterface::deferredWorkRoutine(void *obj)
                     break;
                 case CMD_DEF_PPROC_START:
                     {
+                        int32_t ret = pme->getDefJobStatus(pme->mInitPProcJob);
+                        if (ret != NO_ERROR) {
+                            job_status = ret;
+                            LOGE("PPROC Start failed");
+                            pme->sendEvtNotify(CAMERA_MSG_ERROR,
+                                    CAMERA_ERROR_UNKNOWN, 0);
+                            break;
+                        }
                         QCameraChannel * pChannel = dw->args.pprocArgs;
                         assert(pChannel);
 
                         if (pme->m_postprocessor.start(pChannel) != NO_ERROR) {
-                            ALOGE("%s: cannot start postprocessor", __func__);
-                            pme->sendEvtNotify(CAMERA_MSG_ERROR, CAMERA_ERROR_UNKNOWN, 0);
+                            LOGE("cannot start postprocessor");
+                            job_status = BAD_VALUE;
+                            pme->sendEvtNotify(CAMERA_MSG_ERROR,
+                                    CAMERA_ERROR_UNKNOWN, 0);
                         }
                     }
                     break;
                 case CMD_DEF_METADATA_ALLOC:
                     {
+                        int32_t ret = pme->getDefJobStatus(pme->mParamAllocJob);
+                        if (ret != NO_ERROR) {
+                            job_status = ret;
+                            LOGE("Metadata alloc failed");
+                            pme->sendEvtNotify(CAMERA_MSG_ERROR,
+                                    CAMERA_ERROR_UNKNOWN, 0);
+                            break;
+                        }
                         pme->mMetadataMem = new QCameraMetadataStreamMemory(
                                 QCAMERA_ION_USE_CACHE);
 
                         if (pme->mMetadataMem == NULL) {
-                            ALOGE("%s: Unable to allocate metadata buffers",
-                                    __func__);
+                            LOGE("Unable to allocate metadata buffers");
+                            job_status = BAD_VALUE;
+                            pme->sendEvtNotify(CAMERA_MSG_ERROR,
+                                    CAMERA_ERROR_UNKNOWN, 0);
                         } else {
                             int32_t rc = pme->mMetadataMem->allocate(
                                     dw->args.metadataAllocArgs.bufferCnt,
-                                    dw->args.metadataAllocArgs.size,
-                                    NON_SECURE);
+                                    dw->args.metadataAllocArgs.size);
                             if (rc < 0) {
                                 delete pme->mMetadataMem;
                                 pme->mMetadataMem = NULL;
@@ -9078,19 +11105,25 @@ void *QCamera2HardwareInterface::deferredWorkRoutine(void *obj)
                         QCameraChannel * pChannel = dw->args.pprocArgs;
                         assert(pChannel);
 
-                        if (pme->m_postprocessor.createJpegSession(pChannel) != NO_ERROR) {
-                            ALOGE("%s: cannot create JPEG session", __func__);
-                            pme->sendEvtNotify(CAMERA_MSG_ERROR, CAMERA_ERROR_UNKNOWN, 0);
+                        int32_t ret = pme->getDefJobStatus(pme->mReprocJob);
+                        if (ret != NO_ERROR) {
+                            job_status = ret;
+                            LOGE("Jpeg create failed");
+                            break;
+                        }
+
+                        if (pme->m_postprocessor.createJpegSession(pChannel)
+                            != NO_ERROR) {
+                            LOGE("cannot create JPEG session");
+                            job_status = UNKNOWN_ERROR;
+                            pme->sendEvtNotify(CAMERA_MSG_ERROR,
+                                    CAMERA_ERROR_UNKNOWN, 0);
                         }
                     }
                     break;
                 case CMD_DEF_PPROC_INIT:
                     {
                         int32_t rc = NO_ERROR;
-                        int32_t l_curr_width = 0;
-                        int32_t l_curr_height = 0;
-                        pme->m_max_pic_width = 0;
-                        pme->m_max_pic_height = 0;
 
                         jpeg_encode_callback_t jpegEvtHandle =
                                 dw->args.pprocInitArgs.jpeg_cb;
@@ -9104,35 +11137,26 @@ void *QCamera2HardwareInterface::deferredWorkRoutine(void *obj)
                         cam_padding_info_t& cam_capability_padding_info =
                                 capability->padding_info;
 
-                        for(uint32_t i = 0;
-                                i < capability->picture_sizes_tbl_cnt - 1;
-                                i++) {
-                            l_curr_width =
-                                    capability->picture_sizes_tbl[i].width;
-                            l_curr_height =
-                                    capability->picture_sizes_tbl[i].height;
-
-                            if ((l_curr_width * l_curr_height) >
-                                    (int32_t)(pme->m_max_pic_width *
-                                    pme->m_max_pic_height)) {
-                                pme->m_max_pic_width = l_curr_width;
-                                pme->m_max_pic_height = l_curr_height;
-                            }
-                        }
-
                         if(!pme->mJpegClientHandle) {
                             rc = pme->initJpegHandle();
                             if (rc != NO_ERROR) {
-                                ALOGE("%s: Error!! creating JPEG handle failed", __func__);
+                                LOGE("Error!! creating JPEG handle failed");
+                                job_status = UNKNOWN_ERROR;
+                                pme->sendEvtNotify(CAMERA_MSG_ERROR,
+                                        CAMERA_ERROR_UNKNOWN, 0);
                                 break;
                             }
                         }
-                        CDBG_HIGH("%s: mJpegClientHandle : %d", __func__, pme->mJpegClientHandle);
+                        LOGH("mJpegClientHandle : %d", pme->mJpegClientHandle);
 
-                        rc = postProcessor->setJpegHandle(&pme->mJpegHandle, &pme->mJpegMpoHandle,
+                        rc = postProcessor->setJpegHandle(&pme->mJpegHandle,
+                                &pme->mJpegMpoHandle,
                                 pme->mJpegClientHandle);
                         if (rc != 0) {
-                            ALOGE("%s: Error!! set JPEG handle failed", __func__);
+                            LOGE("Error!! set JPEG handle failed");
+                            job_status = UNKNOWN_ERROR;
+                            pme->sendEvtNotify(CAMERA_MSG_ERROR,
+                                    CAMERA_ERROR_UNKNOWN, 0);
                             break;
                         }
 
@@ -9140,10 +11164,10 @@ void *QCamera2HardwareInterface::deferredWorkRoutine(void *obj)
                         rc = postProcessor->init(jpegEvtHandle, user_data);
 
                         if (rc != NO_ERROR) {
-                            ALOGE("%s: cannot init postprocessor", __func__);
-                            pme->mCameraHandle->ops->close_camera(
-                                    pme->mCameraHandle->camera_handle);
-                            pme->mCameraHandle = NULL;
+                            LOGE("cannot init postprocessor");
+                            job_status = UNKNOWN_ERROR;
+                            pme->sendEvtNotify(CAMERA_MSG_ERROR,
+                                    CAMERA_ERROR_UNKNOWN, 0);
                             break;
                         }
 
@@ -9159,28 +11183,65 @@ void *QCamera2HardwareInterface::deferredWorkRoutine(void *obj)
                             cam_capability_padding_info.height_padding =
                                     padding_info.height_padding;
                         }
-                        if (cam_capability_padding_info.plane_padding <
+                        if (cam_capability_padding_info.plane_padding !=
                                 padding_info.plane_padding) {
                             cam_capability_padding_info.plane_padding =
-                                    padding_info.plane_padding;
+                                    mm_stream_calc_lcm(
+                                    cam_capability_padding_info.plane_padding,
+                                    padding_info.plane_padding);
+                        }
+                        if (cam_capability_padding_info.offset_info.offset_x
+                                != padding_info.offset_info.offset_x) {
+                            cam_capability_padding_info.offset_info.offset_x =
+                                    mm_stream_calc_lcm (
+                                    cam_capability_padding_info.offset_info.offset_x,
+                                    padding_info.offset_info.offset_x);
+                        }
+                        if (cam_capability_padding_info.offset_info.offset_y
+                                != padding_info.offset_info.offset_y) {
+                            cam_capability_padding_info.offset_info.offset_y =
+                            mm_stream_calc_lcm (
+                                    cam_capability_padding_info.offset_info.offset_y,
+                                    padding_info.offset_info.offset_y);
                         }
                     }
                     break;
                 case CMD_DEF_PARAM_ALLOC:
                     {
-                        pthread_mutex_lock(&pme->m_parm_lock);
-                        pme->mParameters.allocate();
-                        pthread_mutex_unlock(&pme->m_parm_lock);
+                        int32_t rc = NO_ERROR;
+                        if (pme->isDualCamera()) {
+                            rc = pme->mParameters.allocate(MM_CAMERA_MAX_CAM_CNT);
+                        } else {
+                            rc = pme->mParameters.allocate();
+                        }
+                        // notify routine would not be initialized by this time.
+                        // So, just update error job status
+                        if (rc != NO_ERROR) {
+                            job_status = rc;
+                            LOGE("Param allocation failed");
+                            break;
+                        }
                     }
                     break;
                 case CMD_DEF_PARAM_INIT:
                     {
-                        int32_t rc = NO_ERROR;
+                        int32_t rc = pme->getDefJobStatus(pme->mParamAllocJob);
+                        if (rc != NO_ERROR) {
+                            job_status = rc;
+                            LOGE("Param init failed");
+                            pme->sendEvtNotify(CAMERA_MSG_ERROR,
+                                    CAMERA_ERROR_UNKNOWN, 0);
+                            break;
+                        }
+
                         uint32_t camId = pme->mCameraId;
                         cam_capability_t * cap = gCamCapability[camId];
 
                         if (pme->mCameraHandle == NULL) {
-                            ALOGE("%s: Camera handle is null", __func__);
+                            LOGE("Camera handle is null");
+                            job_status = BAD_VALUE;
+                            pme->sendEvtNotify(CAMERA_MSG_ERROR,
+                                    CAMERA_ERROR_UNKNOWN, 0);
                             break;
                         }
 
@@ -9188,41 +11249,51 @@ void *QCamera2HardwareInterface::deferredWorkRoutine(void *obj)
                         // time for jpeg_open and calibration data is a
                         // get param for now, so params needs to be initialized
                         // before postproc init
-                        pthread_mutex_lock(&pme->m_parm_lock);
-                        pme->mParameters.init(cap,
+                        rc = pme->mParameters.init(cap,
                                 pme->mCameraHandle,
-                                pme);
-                        rc = pme->mParameters.getRelatedCamCalibration(
-                            &(pme->mJpegMetadata.otp_calibration_data));
-                        CDBG("%s: Dumping Calibration Data Version Id %d rc %d",
-                                __func__,
-                                pme->mJpegMetadata.otp_calibration_data.calibration_format_version,
-                                rc);
+                                pme, pme->m_pFovControl);
                         if (rc != 0) {
-                            pthread_mutex_unlock(&pme->m_parm_lock);
-                            ALOGE("getRelatedCamCalibration failed");
-                            pme->mCameraHandle->ops->close_camera(
-                                pme->mCameraHandle->camera_handle);
-                            pme->mCameraHandle = NULL;
+                            job_status = UNKNOWN_ERROR;
+                            LOGE("Parameter Initialization failed");
+                            pme->sendEvtNotify(CAMERA_MSG_ERROR,
+                                    CAMERA_ERROR_UNKNOWN, 0);
                             break;
                         }
-                        pme->m_bRelCamCalibValid = true;
-                        pme->mJpegMetadata.sensor_mount_angle  =
+
+                        // Get related cam calibration only in
+                        // dual camera mode
+                        if ((pme->getRelatedCamSyncInfo()->sync_control ==
+                                CAM_SYNC_RELATED_SENSORS_ON) || pme->isDualCamera()){
+                            rc = pme->mParameters.getRelatedCamCalibration(
+                                &(pme->mJpegMetadata.otp_calibration_data));
+                            LOGD("Dumping Calibration Data Version Id %f rc %d",
+                                    pme->mJpegMetadata.otp_calibration_data.calibration_format_version,
+                                    rc);
+                            if (rc != 0) {
+                                job_status = UNKNOWN_ERROR;
+                                LOGE("getRelatedCamCalibration failed");
+                                pme->sendEvtNotify(CAMERA_MSG_ERROR,
+                                        CAMERA_ERROR_UNKNOWN, 0);
+                                break;
+                            }
+                            pme->m_bRelCamCalibValid = true;
+                        }
+
+                        pme->mJpegMetadata.sensor_mount_angle =
                             cap->sensor_mount_angle;
                         pme->mJpegMetadata.default_sensor_flip = FLIP_NONE;
 
                         pme->mParameters.setMinPpMask(
                             cap->qcom_supported_feature_mask);
-                        pthread_mutex_unlock(&pme->m_parm_lock);
                         pme->mExifParams.debug_params =
                                 (mm_jpeg_debug_exif_params_t *)
                                 malloc(sizeof(mm_jpeg_debug_exif_params_t));
                         if (!pme->mExifParams.debug_params) {
-                            ALOGE("%s: Out of Memory. Allocation failed for "
-                                    "3A debug exif params", __func__);
-                            pme->mCameraHandle->ops->close_camera(
-                                pme->mCameraHandle->camera_handle);
-                            pme->mCameraHandle = NULL;
+                            LOGE("Out of Memory. Allocation failed for "
+                                    "3A debug exif params");
+                            job_status = NO_MEMORY;
+                            pme->sendEvtNotify(CAMERA_MSG_ERROR,
+                                    CAMERA_ERROR_UNKNOWN, 0);
                             break;
                         }
                         memset(pme->mExifParams.debug_params, 0,
@@ -9232,17 +11303,14 @@ void *QCamera2HardwareInterface::deferredWorkRoutine(void *obj)
                 case CMD_DEF_GENERIC:
                     {
                         BackgroundTask *bgTask = dw->args.genericArgs;
-                        bgTask->bgFunction(bgTask->bgArgs);
+                        job_status = bgTask->bgFunction(bgTask->bgArgs);
                     }
                     break;
                 default:
-                    ALOGE("%s[%d]:  Incorrect command : %d",
-                            __func__,
-                            __LINE__,
-                            dw->cmd);
+                    LOGE("Incorrect command : %d", dw->cmd);
                 }
 
-                pme->dequeueDeferredWork(dw);
+                pme->dequeueDeferredWork(dw, job_status);
             }
             break;
         case CAMERA_CMD_TYPE_EXIT:
@@ -9272,20 +11340,25 @@ uint32_t QCamera2HardwareInterface::queueDeferredWork(DeferredWorkCmd cmd,
                                                       DeferWorkArgs args)
 {
     Mutex::Autolock l(mDefLock);
-    for (uint32_t i = 0; i < MAX_ONGOING_JOBS; ++i) {
-        if (mDefOngoingJobs[i] == 0) {
-            DefWork *dw = new DefWork(cmd, sNextJobId, args);
+    for (int32_t i = 0; i < MAX_ONGOING_JOBS; ++i) {
+        if (mDefOngoingJobs[i].mDefJobId == 0) {
+            DefWork *dw = new DefWork(cmd, mNextJobId, args);
+            if (!dw) {
+                LOGE("out of memory.");
+                return 0;
+            }
             if (mCmdQueue.enqueue(dw)) {
-                mDefOngoingJobs[i] = sNextJobId++;
-                if (sNextJobId == 0) { // handle overflow
-                    sNextJobId = 1;
+                mDefOngoingJobs[i].mDefJobId = mNextJobId++;
+                mDefOngoingJobs[i].mDefJobStatus = 0;
+                if (mNextJobId == 0) { // handle overflow
+                    mNextJobId = 1;
                 }
                 mDeferredWorkThread.sendCmd(CAMERA_CMD_TYPE_DO_NEXT_JOB,
                         FALSE,
                         FALSE);
-                return mDefOngoingJobs[i];
+                return mDefOngoingJobs[i].mDefJobId;
             } else {
-                CDBG("%s: Command queue not active! cmd = %d", __func__, cmd);
+                LOGD("Command queue not active! cmd = %d", cmd);
                 delete dw;
                 return 0;
             }
@@ -9306,12 +11379,15 @@ uint32_t QCamera2HardwareInterface::queueDeferredWork(DeferredWorkCmd cmd,
  *==========================================================================*/
 int32_t QCamera2HardwareInterface::initJpegHandle() {
     // Check if JPEG client handle is present
-    CDBG_HIGH("%s: E", __func__);
+    LOGH("E");
     if(!mJpegClientHandle) {
         mm_dimension max_size = {0, 0};
-        //set max pic size
-        max_size.w = m_max_pic_width;
-        max_size.h = m_max_pic_height;
+        cam_dimension_t size;
+
+        mParameters.getMaxPicSize(size);
+        max_size.w = size.width;
+        max_size.h = size.height;
+
         if (getRelatedCamSyncInfo()->sync_control == CAM_SYNC_RELATED_SENSORS_ON) {
             if (m_bRelCamCalibValid) {
                 mJpegClientHandle = jpeg_open(&mJpegHandle, &mJpegMpoHandle,
@@ -9324,15 +11400,15 @@ int32_t QCamera2HardwareInterface::initJpegHandle() {
             mJpegClientHandle = jpeg_open(&mJpegHandle, NULL, max_size, NULL);
         }
         if (!mJpegClientHandle) {
-            ALOGE("%s: Error !! jpeg_open failed!! ", __func__);
+            LOGE("Error !! jpeg_open failed!! ");
             return UNKNOWN_ERROR;
         }
         // Set JPEG initialized as true to signify that this camera
         // has initialized the handle
         mJpegHandleOwner = true;
     }
-    CDBG_HIGH("%s: X mJpegHandleOwner: %d, mJpegClientHandle: %d camera id: %d",
-            __func__, mJpegHandleOwner, mJpegClientHandle, mCameraId);
+    LOGH("X mJpegHandleOwner: %d, mJpegClientHandle: %d camera id: %d",
+             mJpegHandleOwner, mJpegClientHandle, mCameraId);
     return NO_ERROR;
 }
 
@@ -9347,20 +11423,20 @@ int32_t QCamera2HardwareInterface::initJpegHandle() {
  *==========================================================================*/
 int32_t QCamera2HardwareInterface::deinitJpegHandle() {
     int32_t rc = NO_ERROR;
-    CDBG_HIGH("%s: E", __func__);
+    LOGH("E");
     // Check if JPEG client handle is present and inited by this camera
     if(mJpegHandleOwner && mJpegClientHandle) {
         rc = mJpegHandle.close(mJpegClientHandle);
         if (rc != NO_ERROR) {
-            ALOGE("%s: Error!! Closing mJpegClientHandle: %d failed",
-                    __func__, mJpegClientHandle);
+            LOGE("Error!! Closing mJpegClientHandle: %d failed",
+                     mJpegClientHandle);
         }
         memset(&mJpegHandle, 0, sizeof(mJpegHandle));
         memset(&mJpegMpoHandle, 0, sizeof(mJpegMpoHandle));
         mJpegHandleOwner = false;
     }
     mJpegClientHandle = 0;
-    CDBG_HIGH("%s: X rc = %d", __func__, rc);
+    LOGH("X rc = %d", rc);
     return rc;
 }
 
@@ -9382,7 +11458,7 @@ int32_t QCamera2HardwareInterface::setJpegHandleInfo(mm_jpeg_ops_t *ops,
         mm_jpeg_mpo_ops_t *mpo_ops, uint32_t pJpegClientHandle) {
 
     if (pJpegClientHandle && ops && mpo_ops) {
-        CDBG_HIGH("%s: Setting JPEG client handle %d", __func__,
+        LOGH("Setting JPEG client handle %d",
                 pJpegClientHandle);
         memcpy(&mJpegHandle, ops, sizeof(mm_jpeg_ops_t));
         memcpy(&mJpegMpoHandle, mpo_ops, sizeof(mm_jpeg_mpo_ops_t));
@@ -9390,7 +11466,7 @@ int32_t QCamera2HardwareInterface::setJpegHandleInfo(mm_jpeg_ops_t *ops,
         return NO_ERROR;
     }
     else {
-        CDBG_HIGH("%s: Error!! No Handle found: %d", __func__,
+        LOGE("Error!! No Handle found: %d",
                 pJpegClientHandle);
         return BAD_VALUE;
     }
@@ -9412,14 +11488,17 @@ int32_t QCamera2HardwareInterface::setJpegHandleInfo(mm_jpeg_ops_t *ops,
  *==========================================================================*/
 int32_t QCamera2HardwareInterface::getJpegHandleInfo(mm_jpeg_ops_t *ops,
         mm_jpeg_mpo_ops_t *mpo_ops, uint32_t *pJpegClientHandle) {
-    waitDeferredWork(mInitPProcJob);
 
+    if (NO_ERROR != waitDeferredWork(mInitPProcJob)) {
+        LOGE("Init PProc Deferred work failed");
+        return UNKNOWN_ERROR;
+    }
     // Copy JPEG ops if present
     if (ops && mpo_ops && pJpegClientHandle) {
         memcpy(ops, &mJpegHandle, sizeof(mm_jpeg_ops_t));
         memcpy(mpo_ops, &mJpegMpoHandle, sizeof(mm_jpeg_mpo_ops_t));
         *pJpegClientHandle = mJpegClientHandle;
-        CDBG_HIGH("%s: Getting JPEG client handle %p", __func__,
+        LOGH("Getting JPEG client handle %d",
                 pJpegClientHandle);
         return NO_ERROR;
     } else {
@@ -9428,24 +11507,31 @@ int32_t QCamera2HardwareInterface::getJpegHandleInfo(mm_jpeg_ops_t *ops,
 }
 
 /*===========================================================================
- * FUNCTION   : queueDeferredWork
+ * FUNCTION   : dequeueDeferredWork
  *
  * DESCRIPTION: function which dequeues deferred tasks
  *
  * PARAMETERS :
  *   @dw      : deferred work
- *   @args    : deferred task arguments
+ *   @jobStatus: deferred task job status
  *
  * RETURN     : int32_t type of status
  *              NO_ERROR  -- success
  *              none-zero failure code
  *==========================================================================*/
-uint32_t QCamera2HardwareInterface::dequeueDeferredWork(DefWork* dw)
+uint32_t QCamera2HardwareInterface::dequeueDeferredWork(DefWork* dw, int32_t jobStatus)
 {
     Mutex::Autolock l(mDefLock);
     for (uint32_t i = 0; i < MAX_ONGOING_JOBS; i++) {
-        if (mDefOngoingJobs[i] == dw->id) {
-            mDefOngoingJobs[i] = 0;
+        if (mDefOngoingJobs[i].mDefJobId == dw->id) {
+            if (jobStatus != NO_ERROR) {
+                mDefOngoingJobs[i].mDefJobStatus = jobStatus;
+                LOGH("updating job status %d for id %d",
+                         jobStatus, dw->id);
+            } else {
+                mDefOngoingJobs[i].mDefJobId = 0;
+                mDefOngoingJobs[i].mDefJobStatus = 0;
+            }
             delete dw;
             mDefCond.broadcast();
             return NO_ERROR;
@@ -9454,6 +11540,34 @@ uint32_t QCamera2HardwareInterface::dequeueDeferredWork(DefWork* dw)
 
     return UNKNOWN_ERROR;
 }
+
+/*===========================================================================
+ * FUNCTION   : getDefJobStatus
+ *
+ * DESCRIPTION: Gets if a deferred task is success/fail
+ *
+ * PARAMETERS :
+ *   @job_id  : deferred task id
+ *
+ * RETURN     : NO_ERROR if the job success, otherwise false
+ *
+ * PRECONDITION : mDefLock is held by current thread
+ *==========================================================================*/
+int32_t QCamera2HardwareInterface::getDefJobStatus(uint32_t &job_id)
+{
+    for (uint32_t i = 0; i < MAX_ONGOING_JOBS; i++) {
+        if (mDefOngoingJobs[i].mDefJobId == job_id) {
+            if ( NO_ERROR != mDefOngoingJobs[i].mDefJobStatus ) {
+                LOGE("job_id (%d) was failed", job_id);
+                return mDefOngoingJobs[i].mDefJobStatus;
+            }
+            else
+                return NO_ERROR;
+        }
+    }
+    return NO_ERROR;
+}
+
 
 /*===========================================================================
  * FUNCTION   : checkDeferredWork
@@ -9470,11 +11584,10 @@ uint32_t QCamera2HardwareInterface::dequeueDeferredWork(DefWork* dw)
 bool QCamera2HardwareInterface::checkDeferredWork(uint32_t &job_id)
 {
     for (uint32_t i = 0; i < MAX_ONGOING_JOBS; i++) {
-        if (mDefOngoingJobs[i] == job_id) {
-            return true;
+        if (mDefOngoingJobs[i].mDefJobId == job_id) {
+            return (NO_ERROR == mDefOngoingJobs[i].mDefJobStatus);
         }
     }
-
     return false;
 }
 
@@ -9492,19 +11605,17 @@ bool QCamera2HardwareInterface::checkDeferredWork(uint32_t &job_id)
  *==========================================================================*/
 int32_t QCamera2HardwareInterface::waitDeferredWork(uint32_t &job_id)
 {
-    int32_t rc = NO_ERROR;
     Mutex::Autolock l(mDefLock);
 
     if (job_id == 0) {
-        ALOGE("%s: Invalid job id %d", __func__, job_id);
+        LOGD("Invalid job id %d", job_id);
         return NO_ERROR;
     }
 
-    while ( checkDeferredWork(job_id) == true ) {
+    while (checkDeferredWork(job_id) == true ) {
         mDefCond.waitRelative(mDefLock, CAMERA_DEFERRED_THREAD_TIMEOUT);
     }
-
-    return rc;
+    return getDefJobStatus(job_id);
 }
 
 /*===========================================================================
@@ -9562,11 +11673,9 @@ bool QCamera2HardwareInterface::needDeferred(cam_stream_type_t stream_type)
         return FALSE;
     }
 
-    if ((stream_type == CAM_STREAM_TYPE_PREVIEW)
-            || (stream_type == CAM_STREAM_TYPE_METADATA)
-            || (stream_type == CAM_STREAM_TYPE_RAW)
-            || (stream_type == CAM_STREAM_TYPE_POSTVIEW)) {
-        return TRUE;
+    if ((stream_type == CAM_STREAM_TYPE_RAW)
+            && (mParameters.getofflineRAW() && !mParameters.getQuadraCfa())) {
+        return FALSE;
     }
 
     if ((stream_type == CAM_STREAM_TYPE_SNAPSHOT)
@@ -9574,8 +11683,43 @@ bool QCamera2HardwareInterface::needDeferred(cam_stream_type_t stream_type)
         return TRUE;
     }
 
+    if ((stream_type == CAM_STREAM_TYPE_PREVIEW)
+            || (stream_type == CAM_STREAM_TYPE_METADATA)
+            || (stream_type == CAM_STREAM_TYPE_RAW)
+            || (stream_type == CAM_STREAM_TYPE_POSTVIEW)) {
+        return TRUE;
+    }
+
     if (stream_type == CAM_STREAM_TYPE_VIDEO) {
         return FALSE;
+    }
+    return FALSE;
+}
+
+/*===========================================================================
+ * FUNCTION   : needSyncCB
+ *
+ * DESCRIPTION: Decide syncronous callback per stream
+ *
+ * PARAMETERS :
+ *  @stream_type: stream type
+ *
+ * RETURN     : true - if background task is needed
+ *              false -  if background task is NOT needed
+ *==========================================================================*/
+bool QCamera2HardwareInterface::needSyncCB(cam_stream_type_t stream_type)
+{
+#ifdef TARGET_TS_MAKEUP
+    int whiteLevel, cleanLevel;
+    if(mParameters.getTsMakeupInfo(whiteLevel, cleanLevel) == TRUE) {
+        return FALSE;
+    }
+#endif
+
+    char value[PROPERTY_VALUE_MAX];
+    property_get("persist.vendor.camera.preview.sync_cb", value, "1");
+    if ((atoi(value) == 1) && (stream_type == CAM_STREAM_TYPE_PREVIEW)) {
+        return TRUE;
     }
     return FALSE;
 }
@@ -9598,8 +11742,28 @@ bool QCamera2HardwareInterface::isRegularCapture()
         !isLongshotEnabled() &&
         !mParameters.isHDREnabled() &&
         !mParameters.getRecordingHintValue() &&
-        !isZSLMode() && !mParameters.getofflineRAW()) {
+        !isZSLMode() && (!mParameters.getofflineRAW()|| mParameters.getQuadraCfa())) {
             ret = true;
+    }
+    return ret;
+}
+
+/*===========================================================================
+ * FUNCTION   : needOfflineReprocessing
+ *
+ * DESCRIPTION: Check for offline reprocessing
+ *
+ * PARAMETERS :
+ *
+ * RETURN     : true - regular capture
+ *              false - other type of capture
+ *==========================================================================*/
+bool QCamera2HardwareInterface::needOfflineReprocessing()
+{
+    bool ret = false;
+    if (isRegularCapture()
+            || isDualCamera()) {
+        ret = true;
     }
     return ret;
 }
@@ -9618,26 +11782,9 @@ bool QCamera2HardwareInterface::isRegularCapture()
 void QCamera2HardwareInterface::getLogLevel()
 {
     char prop[PROPERTY_VALUE_MAX];
-    uint32_t globalLogLevel = 0;
 
-    property_get("persist.camera.hal.debug", prop, "0");
-    int val = atoi(prop);
-    if (0 <= val) {
-        gCamHalLogLevel = (uint32_t)val;
-    }
-    property_get("persist.camera.global.debug", prop, "0");
-    val = atoi(prop);
-    if (0 <= val) {
-        globalLogLevel = (uint32_t)val;
-    }
-
-    property_get("persist.camera.kpi.debug", prop, "1");
+    property_get("persist.vendor.camera.kpi.debug", prop, "0");
     gKpiDebugLevel = atoi(prop);
-
-    /* Highest log level among hal.logs and global.logs is selected */
-    if (gCamHalLogLevel < globalLogLevel)
-        gCamHalLogLevel = globalLogLevel;
-
     return;
 }
 
@@ -9658,6 +11805,68 @@ cam_sensor_t QCamera2HardwareInterface::getSensorType()
 }
 
 /*===========================================================================
+ * FUNCTION   : startRAWChannel
+ *
+ * DESCRIPTION: start RAW Channel
+ *
+ * PARAMETERS :
+ *   @pChannel  : Src channel to link this RAW channel.
+ *
+ * RETURN     : int32_t type of status
+ *              NO_ERROR  -- success
+ *              none-zero failure code
+ *==========================================================================*/
+int32_t QCamera2HardwareInterface::startRAWChannel(QCameraChannel *pMetaChannel)
+{
+    int32_t rc = NO_ERROR;
+    QCameraChannel *pChannel = m_channels[QCAMERA_CH_TYPE_RAW];
+    if ((NULL != pChannel) && (mParameters.getofflineRAW())) {
+        // Find and try to link a metadata stream from preview channel
+        QCameraStream *pMetaStream = NULL;
+
+        if (pMetaChannel != NULL) {
+            uint32_t streamNum = pMetaChannel->getNumOfStreams();
+            QCameraStream *pStream = NULL;
+            for (uint32_t i = 0 ; i < streamNum ; i++ ) {
+                pStream = pMetaChannel->getStreamByIndex(i);
+                if ((NULL != pStream) &&
+                        (CAM_STREAM_TYPE_METADATA == pStream->getMyType())) {
+                    pMetaStream = pStream;
+                    break;
+                }
+            }
+
+            if (NULL != pMetaStream) {
+                rc = pChannel->linkStream(pMetaChannel, pMetaStream);
+                if (NO_ERROR != rc) {
+                    LOGE("Metadata stream link failed %d", rc);
+                }
+            }
+        }
+        rc = pChannel->start();
+    }
+    return rc;
+}
+
+/*===========================================================================
+ * FUNCTION   : startRecording
+ *
+ * DESCRIPTION: start recording impl
+ *
+ * PARAMETERS : none
+ *
+ * RETURN     : int32_t type of status
+ *              NO_ERROR  -- success
+ *              none-zero failure code
+ *==========================================================================*/
+int32_t QCamera2HardwareInterface::stopRAWChannel()
+{
+    int32_t rc = NO_ERROR;
+    rc = stopChannel(QCAMERA_CH_TYPE_RAW);
+    return rc;
+}
+
+/*===========================================================================
  * FUNCTION   : isLowPowerMode
  *
  * DESCRIPTION: Returns TRUE if low power mode settings are to be applied for video recording
@@ -9674,7 +11883,7 @@ bool QCamera2HardwareInterface::isLowPowerMode()
     mParameters.getStreamDimension(CAM_STREAM_TYPE_VIDEO, dim);
 
     char prop[PROPERTY_VALUE_MAX];
-    property_get("camera.lowpower.record.enable", prop, "0");
+    property_get("vendor.camera.lowpower.record.enable", prop, "0");
     int enable = atoi(prop);
 
     //Enable low power mode if :
@@ -9683,7 +11892,104 @@ bool QCamera2HardwareInterface::isLowPowerMode()
 
     bool isLowpower = mParameters.getRecordingHintValue() && enable
             && ((dim.width * dim.height) >= (2048 * 1080));
+    isLowpower = isLowpower || (mParameters.isHfrMode() && !mParameters.getBufBatchCount());
+    mParameters.setLowPower(isLowpower);
+    LOGD("low power mode %d",isLowpower);
     return isLowpower;
+}
+
+/*===========================================================================
+ * FUNCTION   : getBootToMonoTimeOffset
+ *
+ * DESCRIPTION: Calculate offset that is used to convert from
+ *              clock domain of boot to monotonic
+ *
+ * PARAMETERS :
+ *   None
+ *
+ * RETURN     : clock offset between boottime and monotonic time.
+ *
+ *==========================================================================*/
+nsecs_t QCamera2HardwareInterface::getBootToMonoTimeOffset()
+{
+    // try three times to get the clock offset, choose the one
+    // with the minimum gap in measurements.
+    const int tries = 3;
+    nsecs_t bestGap, measured;
+    for (int i = 0; i < tries; ++i) {
+        const nsecs_t tmono = systemTime(SYSTEM_TIME_MONOTONIC);
+        const nsecs_t tbase = systemTime(SYSTEM_TIME_BOOTTIME);
+        const nsecs_t tmono2 = systemTime(SYSTEM_TIME_MONOTONIC);
+        const nsecs_t gap = tmono2 - tmono;
+        if (i == 0 || gap < bestGap) {
+            bestGap = gap;
+            measured = tbase - ((tmono + tmono2) >> 1);
+        }
+    }
+    return measured;
+}
+
+/*===========================================================================
+ * FUNCTION   : fillDualCameraFOVControl
+ *
+ * DESCRIPTION: Function to process FOV ctrl event from statemachine thread.
+ *
+ * PARAMETERS : none
+ *
+ * RETURN     : none
+ *==========================================================================*/
+void QCamera2HardwareInterface::fillDualCameraFOVControl()
+{
+    qcamera_sm_internal_evt_payload_t *payload =
+       (qcamera_sm_internal_evt_payload_t *)
+       malloc(sizeof(qcamera_sm_internal_evt_payload_t));
+    if (NULL != payload) {
+        memset(payload, 0, sizeof(qcamera_sm_internal_evt_payload_t));
+        payload->evt_type = QCAMERA_INTERNAL_EVT_DUAL_CAMERA_FOV_CONTROL;
+        int32_t rc = processEvt(QCAMERA_SM_EVT_EVT_INTERNAL, payload);
+        if (rc != NO_ERROR) {
+            LOGE("processEvt Dual camera fill FOV control failed");
+            free(payload);
+            payload = NULL;
+        }
+    } else {
+        LOGE("No memory for Dual camera fill FOV control event");
+    }
+}
+
+/*===========================================================================
+ * FUNCTION   : configureSnapshotSkip
+ *
+ * DESCRIPTION: function to configure snapshot skip in dual camera usecases.
+ *
+ * PARAMETERS : skip - whether to enable/disable snapshot skip
+ *
+ * RETURN     : none
+ *==========================================================================*/
+void QCamera2HardwareInterface::configureSnapshotSkip(bool skip)
+{
+    if (isDualCamera() && isZSLMode() &&
+            (mParameters.getHalPPType() == CAM_HAL_PP_TYPE_BOKEH)) {
+        QCameraChannel *pChannel = NULL;
+        pChannel = m_channels[QCAMERA_CH_TYPE_ZSL];
+        if (NULL != pChannel) {
+            QCameraStream *pStream = NULL;
+            for (uint32_t i = 0; i < pChannel->getNumOfStreams(); i++) {
+                pStream = pChannel->getStreamByIndex(i);
+                if (pStream != NULL) {
+                    if (pStream->isTypeOf(CAM_STREAM_TYPE_SNAPSHOT)) {
+                        cam_stream_parm_buffer_t param;
+                        memset(&param, 0, sizeof(param));
+                        param.type = CAM_STREAM_PARAM_TYPE_FRAME_SKIP;
+                        param.skipPattern = skip ? SKIP_ALL : NO_SKIP;
+                        pStream->setParameter(param);
+                    }
+                }
+            }
+            if (skip)
+                ((QCameraPicChannel *)pChannel)->flushSuperbuffer(mActiveCameras, 0);
+        }
+    }
 }
 
 }; // namespace qcamera

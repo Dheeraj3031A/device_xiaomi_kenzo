@@ -1,4 +1,4 @@
-/* Copyright (c) 2015, The Linux Foundataion. All rights reserved.
+/* Copyright (c) 2015-2016, The Linux Foundation. All rights reserved.
 *
 * Redistribution and use in source and binary forms, with or without
 * modification, are permitted provided that the following conditions are
@@ -30,9 +30,8 @@
 #ifndef __QCAMERA3CROPREGIONMAPPER_H__
 #define __QCAMERA3CROPREGIONMAPPER_H__
 
-#include <utils/Log.h>
+// System dependencies
 #include <utils/Errors.h>
-#include "QCamera3HALHeader.h"
 
 using namespace android;
 
@@ -51,6 +50,8 @@ public:
             int32_t& crop_width, int32_t& crop_height);
     void toActiveArray(uint32_t& x, uint32_t& y);
     void toSensor(uint32_t& x, uint32_t& y);
+    void convertFDROI(int32_t& crop_left, int32_t& crop_top,
+            int32_t& crop_width, int32_t& crop_height);
 
 private:
     /* sensor output size */

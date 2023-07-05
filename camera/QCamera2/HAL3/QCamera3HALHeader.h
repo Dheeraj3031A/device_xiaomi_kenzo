@@ -1,17 +1,17 @@
-/* Copyright (c) 2013-2015, The Linux Foundataion. All rights reserved.
+/* Copyright (c) 2013-2019, The Linux Foundation. All rights reserved.
 *
 * Redistribution and use in source and binary forms, with or without
 * modification, are permitted provided that the following conditions are
 * met:
 *     * Redistributions of source code must retain the above copyright
-*	notice, this list of conditions and the following disclaimer.
+*       notice, this list of conditions and the following disclaimer.
 *     * Redistributions in binary form must reproduce the above
-*	copyright notice, this list of conditions and the following
-*	disclaimer in the documentation and/or other materials provided
-*	with the distribution.
+*       copyright notice, this list of conditions and the following
+*       disclaimer in the documentation and/or other materials provided
+*       with the distribution.
 *     * Neither the name of The Linux Foundation nor the names of its
-*	contributors may be used to endorse or promote products derived
-*	from this software without specific prior written permission.
+*       contributors may be used to endorse or promote products derived
+*       from this software without specific prior written permission.
 *
 * THIS SOFTWARE IS PROVIDED "AS IS" AND ANY EXPRESS OR IMPLIED
 * WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
@@ -29,24 +29,45 @@
 #ifndef __QCAMERA_HALHEADER_H__
 #define __QCAMERA_HALHEADER_H__
 
-extern "C" {
-#include <mm_camera_interface.h>
-#include <mm_jpeg_interface.h>
-}
+// System dependencies
+#include "hardware/gralloc.h"
 
-using namespace android;
+// Camera dependencies
+#include "cam_types.h"
+
+extern "C" {
+#include "mm_jpeg_interface.h"
+}
 
 namespace qcamera {
 
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 
+#define IS_USAGE_ZSL(usage)  (((usage) & (GRALLOC_USAGE_HW_CAMERA_ZSL)) \
+        == (GRALLOC_USAGE_HW_CAMERA_ZSL))
+
+#define IS_USAGE_SECURE(usage) (((usage) & (GRALLOC_USAGE_PROTECTED)) \
+        == (GRALLOC_USAGE_PROTECTED))
+
+#define IS_USAGE_UBWC(usage) (((usage) & (GRALLOC_USAGE_PRIVATE_ALLOC_UBWC)) \
+        == (GRALLOC_USAGE_PRIVATE_ALLOC_UBWC))
+
 class QCamera3Channel;
+class QCamera3ProcessingChannel;
 
     typedef enum {
         INVALID,
         VALID,
     } stream_status_t;
+
+    typedef enum {
+       REPROCESS_TYPE_NONE,
+       REPROCESS_TYPE_JPEG,
+       REPROCESS_TYPE_YUV,
+       REPROCESS_TYPE_PRIVATE,
+       REPROCESS_TYPE_RAW
+    } reprocess_type_t;
 
     typedef struct {
         uint32_t out_buf_index;
@@ -59,6 +80,23 @@ class QCamera3Channel;
         uint8_t gps_coordinates_valid;
         double gps_coordinates[3];
         char gps_processing_method[GPS_PROCESSING_METHOD_SIZE];
+        uint8_t image_desc_valid;
+        char image_desc[EXIF_IMAGE_DESCRIPTION_SIZE];
+        bool hdr_snapshot;
+        bool multiframe_snapshot;
+        cam_hal3_JPEG_type_t image_type;
+        bool is_dim_valid;
+        cam_dimension_t output_dim;
+        bool is_offset_valid;
+        cam_frame_len_offset_t offset;
+        bool is_format_valid;
+        cam_format_t format;
+        bool is_crop_valid;
+        cam_rect_t crop;
+        mm_jpeg_image_type_t encode_type;
+        bool zsl_snapshot;
+        uint32_t frame_number;
+        bool raw_mfc_snapshot;
     } jpeg_settings_t;
 
     typedef struct {
@@ -69,12 +107,16 @@ class QCamera3Channel;
     typedef struct {
         cam_stream_type_t stream_type;
         cam_format_t stream_format;
+        cam_format_t output_stream_format;
         cam_dimension_t input_stream_dim;
         cam_stream_buf_plane_info_t input_stream_plane_info;
         cam_dimension_t output_stream_dim;
         cam_padding_info_t *padding;
+        reprocess_type_t reprocess_type;
+        cam_hdr_param_t hdr_param;
         QCamera3Channel *src_channel;
     } reprocess_config_t;
+
 };//namespace qcamera
 
 #endif

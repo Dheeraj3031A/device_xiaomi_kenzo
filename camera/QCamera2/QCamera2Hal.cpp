@@ -1,4 +1,4 @@
-/* Copyright (c) 2012-2014, The Linux Foundataion. All rights reserved.
+/* Copyright (c) 2012-2016, The Linux Foundation. All rights reserved.
 *
 * Redistribution and use in source and binary forms, with or without
 * modification, are permitted provided that the following conditions are
@@ -27,12 +27,15 @@
 *
 */
 
+// Camera dependencies
 #include "QCamera2Factory.h"
+#include "util/QCameraCommon.h"
 #include "HAL3/QCamera3VendorTags.h"
+#include "util/QCameraCommon.h"
 
 static hw_module_t camera_common = {
     .tag                    = HARDWARE_MODULE_TAG,
-    .module_api_version     = CAMERA_MODULE_API_VERSION_2_3,
+    .module_api_version     = CAMERA_MODULE_API_VERSION_2_4,
     .hal_api_version        = HARDWARE_HAL_API_VERSION,
     .id                     = CAMERA_HARDWARE_MODULE_ID,
     .name                   = "QCamera Module",
@@ -48,10 +51,9 @@ camera_module_t HAL_MODULE_INFO_SYM = {
     .get_camera_info        = qcamera::QCamera2Factory::get_camera_info,
     .set_callbacks          = qcamera::QCamera2Factory::set_callbacks,
     .get_vendor_tag_ops     = qcamera::QCamera3VendorTags::get_vendor_tag_ops,
-    .open_legacy            = qcamera::QCamera2Factory::open_legacy,
-#ifndef USE_L_MR1
-    .set_torch_mode         = NULL,
+    .open_legacy            = (qcamera::QCameraCommon::needHAL1Support()) ?
+                                    qcamera::QCamera2Factory::open_legacy : NULL,
+    .set_torch_mode         = qcamera::QCamera2Factory::set_torch_mode,
     .init                   = NULL,
-#endif
     .reserved               = {0}
 };
