@@ -532,6 +532,10 @@ PRODUCT_PROPERTY_OVERRIDES += \
 	ro.hdmi.mirror.enable=true \
 	persist.sys.wfd.virtual=0
 
+# Xiaomi Parts
+PRODUCT_PACKAGES += \
+    XiaomiParts
+
 # USB debugging
 PRODUCT_PROPERTY_OVERRIDES += \
     persist.sys.usb.config=mtp,adb \
