@@ -85,11 +85,7 @@ BOARD_QTI_CAMERA_32BIT_ONLY := true
 USE_DEVICE_SPECIFIC_CAMERA := true
 TARGET_TS_MAKEUP := true
 TARGET_PROCESS_SDK_VERSION_OVERRIDE := \
-        /system/bin/mm-qcamera-daemon=23
-
-# Charger
-WITH_CUSTOM_CHARGER := false
-
+    /system/bin/mm-qcamera-daemon=23
 
 # Display
 BOARD_USES_ADRENO := true
@@ -197,19 +193,12 @@ TARGET_RELEASETOOLS_EXTENSIONS := $(DEVICE_PATH)/releasetools
 
 # RIL
 PROTOBUF_SUPPORTED := true
-USE_DEVICE_SPECIFIC_DATA_IPA_CFG_MGR := true
 TARGET_USES_ALTERNATIVE_MANUAL_NETWORK_SELECT := true
 
 # SELinux
 include device/qcom/sepolicy-legacy/sepolicy.mk
 BOARD_VENDOR_SEPOLICY_DIRS += $(DEVICE_PATH)/sepolicy/vendor
 BOARD_PLAT_PRIVATE_SEPOLICY_DIR += $(DEVICE_PATH)/sepolicy/private
-
-# Thermal
-USE_DEVICE_SPECIFIC_THERMAL := true
-
-# Vr
-USE_DEVICE_SPECIFIC_VR := true
 
 # Wifi
 WPA_SUPPLICANT_VERSION      := VER_0_8_X
