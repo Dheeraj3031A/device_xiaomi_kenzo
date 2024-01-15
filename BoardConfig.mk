@@ -154,7 +154,7 @@ BOARD_MKBOOTIMG_ARGS := --ramdisk_offset 0x01000000 --tags_offset 0x00000100
 BOARD_KERNEL_IMAGE_NAME := Image.gz-dtb
 TARGET_KERNEL_HEADER_ARCH := arm64
 TARGET_KERNEL_SOURCE := kernel/xiaomi/kenzo
-TARGET_KERNEL_CONFIG := lineageos_kenzo_defconfig
+TARGET_KERNEL_CONFIG := kenzo_defconfig
 
 # Keymaster
 TARGET_PROVIDES_KEYMASTER := true
