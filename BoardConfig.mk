@@ -197,7 +197,7 @@ TARGET_USES_ALTERNATIVE_MANUAL_NETWORK_SELECT := true
 # SELinux
 include device/qcom/sepolicy-legacy/sepolicy.mk
 BOARD_VENDOR_SEPOLICY_DIRS += $(DEVICE_PATH)/sepolicy/vendor
-BOARD_PLAT_PRIVATE_SEPOLICY_DIR += $(DEVICE_PATH)/sepolicy/private
+SYSTEM_EXT_PRIVATE_SEPOLICY_DIRS += $(DEVICE_PATH)/sepolicy/private
 
 # Wifi
 WPA_SUPPLICANT_VERSION      := VER_0_8_X
