@@ -156,6 +156,11 @@ TARGET_KERNEL_HEADER_ARCH := arm64
 TARGET_KERNEL_SOURCE := kernel/xiaomi/kenzo
 TARGET_KERNEL_CONFIG := kenzo_defconfig
 
+#Prebuilt Kernel
+TARGET_PREBUILT_KERNEL := device/xiaomi/kenzo/prebuilt/Image.gz-dtb
+PRODUCT_COPY_FILES += \
+	$(TARGET_PREBUILT_KERNEL):kernel
+
 # Keymaster
 TARGET_PROVIDES_KEYMASTER := true
 
