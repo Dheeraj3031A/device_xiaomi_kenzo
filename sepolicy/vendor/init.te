@@ -51,6 +51,5 @@ allow init vndbinder_device:chr_file { ioctl open read write };
 
 allow init rootfs:file { execute_no_trans };
 allow init hal_keymaster_hwservice:hwservice_manager { add  find };
-allow init hal_power_service:service_manager { add };
 allow init servicemanager:binder { call  transfer };
 allow init sysfs_battery_supply:file { setattr };
