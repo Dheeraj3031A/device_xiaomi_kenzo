@@ -18,4 +18,3 @@ allow servicemanager hal_power_default:dir search;
 allow servicemanager hal_power_default:file { open read };
 allow servicemanager hal_power_default:process getattr;
 
-allow servicemanager hal_power_service:service_manager { add };
