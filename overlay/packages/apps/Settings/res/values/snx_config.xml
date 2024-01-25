@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources xmlns:xliff="urn:oasis:names:tc:xliff:document:1.2">
+
+    <string name="ap_device_name">Device name</string>
+    <string name="ap_device_name_summary">Redmi Note 3 Pro</string>
+    <string name="ap_chipset_type">Chipset</string>
+    <string name="ap_chipset_type_summary">Snapdragon 650 (msm8956)</string>
+    <string name="ap_gpu">GPU</string>
+    <string name="ap_gpu_summary">Adreno 510</string>
+    <string name="ap_camera_mp">Camera</string>
+    <string name="ap_camera_mp_summary">16MP Back + 5MP Front Camera</string>
+    <string name="ap_screen_type">Screen</string>
+    <string name="ap_screen_type_summary">IPS LCD 5.5 Screen</string>
+    <string name="maintainer_name">NotDheeraj06</string>
+
+</resources>
