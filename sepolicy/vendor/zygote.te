@@ -6,7 +6,6 @@ allow zygote theme_prop:file { r_file_perms } ;
 
 allow zygote bluetooth_prop:file { r_file_perms };
 
-allow zygote exported_camera_prop:file read;
 allow zygote proc_cmdline:file { getattr open read };
 allow zygote sysfs:file { getattr open read };
 allow zygote bluetooth_prop:file open;
