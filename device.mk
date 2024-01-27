@@ -362,6 +362,10 @@ PRODUCT_COPY_FILES += \
 PRODUCT_COPY_FILES += \
     $(LOCAL_PATH)/configs/privapp-permissions-qti.xml:$(TARGET_COPY_OUT_SYSTEM)/etc/permissions/privapp-permissions-qti.xml
     
+# Propertites
+PRODUCT_PROPERTY_OVERRIDES += \
+    ro.kernel.ebpf.supported=false
+
 # Power
 PRODUCT_PACKAGES += \
     android.hardware.power-service-qti \
@@ -479,6 +483,9 @@ PRODUCT_COPY_FILES += \
 PRODUCT_COPY_FILES += \
     $(LOCAL_PATH)/configs/qti_whitelist.xml:$(TARGET_COPY_OUT_SYSTEM)/etc/sysconfig/qti_whitelist.xml
 
+# VNDK
+PRODUCT_PROPERTY_OVERRIDES +=
+    ro.vndk.version=current
 
 # VNDK
 PRODUCT_COPY_FILES += \
