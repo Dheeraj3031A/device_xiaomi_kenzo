@@ -234,3 +234,4 @@ include vendor/xiaomi/kenzo/BoardConfigVendor.mk
 
 BUILD_BROKEN_DUP_RULES := true
 BUILD_BROKEN_USES_BUILD_COPY_HEADERS := true
+BUILD_BROKEN_INCORRECT_PARTITION_IMAGES := true
