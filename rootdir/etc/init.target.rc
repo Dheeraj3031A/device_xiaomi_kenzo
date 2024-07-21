@@ -53,7 +53,7 @@ mkdir /data/vendor/camera 0770 camera camera
 
 #start camera server as daemon
 service qcamerasvr /system/bin/mm-qcamera-daemon
-    class late_start
+    class hal
     user camera
     group camera system inet input graphics
 
