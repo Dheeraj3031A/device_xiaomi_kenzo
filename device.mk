@@ -82,10 +82,6 @@ PRODUCT_PACKAGES += \
 TARGET_SCREEN_HEIGHT := 1920
 TARGET_SCREEN_WIDTH := 1080
 
-# Advanced Controls
-PRODUCT_PACKAGES += \
-    AdvancedControls
-
 # Audio
 PRODUCT_PACKAGES += \
     android.hardware.audio@6.0-impl \
@@ -135,11 +131,8 @@ PRODUCT_PROPERTY_OVERRIDES += \
     dalvik.vm.dex2oat-cpu-set=0,1,4,5 \
     dalvik.vm.dex2oat-filter=speed \
     dalvik.vm.image-dex2oat-cpu-set=0,1,4,5 \
-    dalvik.vm.image-dex2oat-filter=speed \
-    dalvik.vm.image-dex2oat-threads=4 \
-    dalvik.vm.dex2oat-minidebuginfo=false \
-    dalvik.vm.minidebuginfo=false
-
+    dalvik.vm.image-dex2oat-threads=4 
+    
 # Bluetooth
 PRODUCT_PACKAGES += \
     android.hardware.bluetooth.audio@2.0-impl \
@@ -262,10 +255,6 @@ PRODUCT_PACKAGES += \
     libhidltransport \
     libhwbinder \
     vndservicemanager
-
-# HW crypto
-PRODUCT_PACKAGES += \
-    vendor.qti.hardware.cryptfshw@1.0-service-qti.qsee
 
 # Input
 PRODUCT_COPY_FILES += \

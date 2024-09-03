@@ -104,8 +104,8 @@ TARGET_USES_C2D_COMPOSITION := true
 TARGET_USES_ION := true
 
 # Encryption
-TARGET_HW_DISK_ENCRYPTION := true
-TARGET_CRYPTFS_HW_PATH ?= vendor/qcom/opensource/cryptfs_hw
+#TARGET_HW_DISK_ENCRYPTION := true
+#TARGET_CRYPTFS_HW_PATH ?= vendor/qcom/opensource/cryptfs_hw
 
 # Enable real time lockscreen charging current values
 BOARD_GLOBAL_CFLAGS += -DBATTERY_REAL_INFO
@@ -139,7 +139,8 @@ TARGET_QCOM_NO_FM_FIRMWARE := true
 
 # HIDL
 DEVICE_MANIFEST_FILE := $(DEVICE_PATH)/manifest.xml
-DEVICE_MATRIX_FILE   := $(DEVICE_PATH)/compatibility_matrix.xml
+DEVICE_MATRIX_FILE := $(DEVICE_PATH)/compatibility_matrix.xml
+DEVICE_FRAMEWORK_COMPATIBILITY_MATRIX_FILE := $(DEVICE_PATH)/compatibility_matrix.legacy.xml
 
 # GPS
 USE_DEVICE_SPECIFIC_GPS := true

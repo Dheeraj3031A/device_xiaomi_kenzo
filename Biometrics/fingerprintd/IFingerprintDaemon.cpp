@@ -20,7 +20,6 @@
 
 #include <binder/IPCThreadState.h>
 #include <binder/IServiceManager.h>
-#include <binder/PermissionCache.h>
 #include <utils/String16.h>
 #include <utils/Looper.h>
 #include <hardware/hardware.h>
@@ -35,12 +34,27 @@ static const String16 MANAGE_FINGERPRINT_PERMISSION("android.permission.MANAGE_F
 static const String16 HAL_FINGERPRINT_PERMISSION("android.permission.MANAGE_FINGERPRINT"); // TODO
 static const String16 DUMP_PERMISSION("android.permission.DUMP");
 
+// Example direct permission check function
+bool checkPermissionDirectly(const String16& permission) {
+    const IPCThreadState* ipc = IPCThreadState::self();
+    const int calling_uid = ipc->getCallingUid();
+
+    // Implement direct permission check logic here
+    // This is a placeholder and should be replaced with actual permission check code
+    if (permission == HAL_FINGERPRINT_PERMISSION) {
+        // Example logic: check if the calling UID has the necessary permission
+        // This is a mock check. Replace it with your actual permission checking logic.
+        return (calling_uid == 1000);  // Replace with actual UID or permission check logic
+    }
+    return false;
+}
+
 status_t BnFingerprintDaemon::onTransact(uint32_t code, const Parcel& data, Parcel* reply,
         uint32_t flags) {
     switch(code) {
         case AUTHENTICATE: {
             CHECK_INTERFACE(IFingerprintDaemon, data, reply);
-            if (!checkPermission(HAL_FINGERPRINT_PERMISSION)) {
+            if (!checkPermissionDirectly(HAL_FINGERPRINT_PERMISSION)) {
                 return PERMISSION_DENIED;
             }
             const uint64_t sessionId = data.readInt64();
@@ -49,10 +63,10 @@ status_t BnFingerprintDaemon::onTransact(uint32_t code, const Parcel& data, Parc
             reply->writeNoException();
             reply->writeInt32(ret);
             return NO_ERROR;
-        };
+        }
         case CANCEL_AUTHENTICATION: {
             CHECK_INTERFACE(IFingerprintDaemon, data, reply);
-            if (!checkPermission(HAL_FINGERPRINT_PERMISSION)) {
+            if (!checkPermissionDirectly(HAL_FINGERPRINT_PERMISSION)) {
                 return PERMISSION_DENIED;
             }
             const int32_t ret = stopAuthentication();
@@ -62,7 +76,7 @@ status_t BnFingerprintDaemon::onTransact(uint32_t code, const Parcel& data, Parc
         }
         case ENROLL: {
             CHECK_INTERFACE(IFingerprintDaemon, data, reply);
-            if (!checkPermission(HAL_FINGERPRINT_PERMISSION)) {
+            if (!checkPermissionDirectly(HAL_FINGERPRINT_PERMISSION)) {
                 return PERMISSION_DENIED;
             }
             const ssize_t tokenSize = data.readInt32();
@@ -76,7 +90,7 @@ status_t BnFingerprintDaemon::onTransact(uint32_t code, const Parcel& data, Parc
         }
         case CANCEL_ENROLLMENT: {
             CHECK_INTERFACE(IFingerprintDaemon, data, reply);
-            if (!checkPermission(HAL_FINGERPRINT_PERMISSION)) {
+            if (!checkPermissionDirectly(HAL_FINGERPRINT_PERMISSION)) {
                 return PERMISSION_DENIED;
             }
             const int32_t ret = stopEnrollment();
@@ -86,7 +100,7 @@ status_t BnFingerprintDaemon::onTransact(uint32_t code, const Parcel& data, Parc
         }
         case PRE_ENROLL: {
             CHECK_INTERFACE(IFingerprintDaemon, data, reply);
-            if (!checkPermission(HAL_FINGERPRINT_PERMISSION)) {
+            if (!checkPermissionDirectly(HAL_FINGERPRINT_PERMISSION)) {
                 return PERMISSION_DENIED;
             }
             const uint64_t ret = preEnroll();
@@ -96,7 +110,7 @@ status_t BnFingerprintDaemon::onTransact(uint32_t code, const Parcel& data, Parc
         }
         case POST_ENROLL: {
             CHECK_INTERFACE(IFingerprintDaemon, data, reply);
-            if (!checkPermission(HAL_FINGERPRINT_PERMISSION)) {
+            if (!checkPermissionDirectly(HAL_FINGERPRINT_PERMISSION)) {
                 return PERMISSION_DENIED;
             }
             const int32_t ret = postEnroll();
@@ -106,7 +120,7 @@ status_t BnFingerprintDaemon::onTransact(uint32_t code, const Parcel& data, Parc
         }
         case REMOVE: {
             CHECK_INTERFACE(IFingerprintDaemon, data, reply);
-            if (!checkPermission(HAL_FINGERPRINT_PERMISSION)) {
+            if (!checkPermissionDirectly(HAL_FINGERPRINT_PERMISSION)) {
                 return PERMISSION_DENIED;
             }
             const int32_t fingerId = data.readInt32();
@@ -118,7 +132,7 @@ status_t BnFingerprintDaemon::onTransact(uint32_t code, const Parcel& data, Parc
         }
         case ENUMERATE: {
             CHECK_INTERFACE(IFingerprintDaemon, data, reply);
-            if (!checkPermission(HAL_FINGERPRINT_PERMISSION)) {
+            if (!checkPermissionDirectly(HAL_FINGERPRINT_PERMISSION)) {
                 return PERMISSION_DENIED;
             }
             const int32_t ret = enumerate();
@@ -128,7 +142,7 @@ status_t BnFingerprintDaemon::onTransact(uint32_t code, const Parcel& data, Parc
         }
         case GET_AUTHENTICATOR_ID: {
             CHECK_INTERFACE(IFingerprintDaemon, data, reply);
-            if (!checkPermission(HAL_FINGERPRINT_PERMISSION)) {
+            if (!checkPermissionDirectly(HAL_FINGERPRINT_PERMISSION)) {
                 return PERMISSION_DENIED;
             }
             const uint64_t ret = getAuthenticatorId();
@@ -138,7 +152,7 @@ status_t BnFingerprintDaemon::onTransact(uint32_t code, const Parcel& data, Parc
         }
         case SET_ACTIVE_GROUP: {
             CHECK_INTERFACE(IFingerprintDaemon, data, reply);
-            if (!checkPermission(HAL_FINGERPRINT_PERMISSION)) {
+            if (!checkPermissionDirectly(HAL_FINGERPRINT_PERMISSION)) {
                 return PERMISSION_DENIED;
             }
             const int32_t group = data.readInt32();
@@ -151,7 +165,7 @@ status_t BnFingerprintDaemon::onTransact(uint32_t code, const Parcel& data, Parc
         }
         case OPEN_HAL: {
             CHECK_INTERFACE(IFingerprintDaemon, data, reply);
-            if (!checkPermission(HAL_FINGERPRINT_PERMISSION)) {
+            if (!checkPermissionDirectly(HAL_FINGERPRINT_PERMISSION)) {
                 return PERMISSION_DENIED;
             }
             const int64_t ret = openHal();
@@ -161,7 +175,7 @@ status_t BnFingerprintDaemon::onTransact(uint32_t code, const Parcel& data, Parc
         }
         case CLOSE_HAL: {
             CHECK_INTERFACE(IFingerprintDaemon, data, reply);
-            if (!checkPermission(HAL_FINGERPRINT_PERMISSION)) {
+            if (!checkPermissionDirectly(HAL_FINGERPRINT_PERMISSION)) {
                 return PERMISSION_DENIED;
             }
             const int32_t ret = closeHal();
@@ -172,14 +186,6 @@ status_t BnFingerprintDaemon::onTransact(uint32_t code, const Parcel& data, Parc
         default:
             return BBinder::onTransact(code, data, reply, flags);
     }
-};
-
-bool BnFingerprintDaemon::checkPermission(const String16& permission) {
-    const IPCThreadState* ipc = IPCThreadState::self();
-    const int calling_pid = ipc->getCallingPid();
-    const int calling_uid = ipc->getCallingUid();
-
-    return PermissionCache::checkPermission(permission, calling_pid, calling_uid);
 }
 
 class BpFingerprintDaemon : public BpInterface<IFingerprintDaemon> {
