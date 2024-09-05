@@ -41,9 +41,6 @@
 # FRP
 /dev/block/platform/soc/7824900.sdhci/by-name/config                                      u:object_r:frp_block_device:s0
 
-# Fingerprint
-/vendor/bin/hw/android\.hardware\.biometrics\.fingerprint@2\.1-service\.xiaomi_kenzo u:object_r:hal_fingerprint_default_exec:s0
-
 # Flashlight
 #/sys/devices/soc/qpnp-flash-led-23/leds/flashlight/brightness                             u:object_r:sysfs_flashlight:s0
 
