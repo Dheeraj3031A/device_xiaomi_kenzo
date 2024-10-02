@@ -399,8 +399,7 @@ PRODUCT_PACKAGES += \
 PRODUCT_PACKAGES += \
     fstab.qcom \
     init.qcom.early_boot.sh \
-    init.qcom.sh \
-    init.qcom.power.rc
+    init.qcom.sh
 
 PRODUCT_PACKAGES += \
     init.qcom.rc \
