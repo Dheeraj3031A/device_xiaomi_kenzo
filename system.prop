@@ -217,6 +217,3 @@ ro.max.fling_velocity=40000
 
 #disable_blur
 persist.sys.sf.disable_blurs=1
-
-# Havoc OS props
-ro.havoc.maintainer=NotDheeraj06
