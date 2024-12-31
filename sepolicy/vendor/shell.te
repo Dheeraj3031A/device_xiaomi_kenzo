@@ -1,0 +1,6 @@
+allow shell kernel:system syslog_read;
+allow shell {
+  bluetooth_prop
+  device_config_runtime_native_boot_prop
+}:file { read };
+dontaudit shell idmap_exec:file { execute };
