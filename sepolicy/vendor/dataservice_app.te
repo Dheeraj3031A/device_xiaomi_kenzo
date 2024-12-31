@@ -1,3 +1,0 @@
-allow dataservice_app hal_datafactory_hwservice:hwservice_manager find;
-
-allow dataservice_app ims:binder { call transfer };

@@ -1,8 +1,3 @@
-# ADPL
-/dev/ipa_adpl                                                                               u:object_r:ipa_dev:s0
-/dev/socket/adpl_cmd_uds_file                                                               u:object_r:dataadpl_socket:s0
-/vendor/bin/adpl                                                            u:object_r:adpl_exec:s0
-
 # Camera
 /data/vendor/qcam(/.*)?                                                                     u:object_r:vendor_camera_data_file:s0
 
@@ -26,11 +21,6 @@
 # DRM
 /vendor/bin/hw/android\.hardware\.drm@1\.[1-3]-service.clearkey             u:object_r:hal_drm_clearkey_exec:s0
 /vendor/bin/hw/android\.hardware\.drm@1\.[1-3]-service.widevine             u:object_r:hal_drm_widevine_exec:s0
-
-/data/vendor/mediadrm(/.*)?                                                                 u:object_r:mediadrm_vendor_data_file:s0
-
-# DPMD
-/(product|system/product)/bin/dpmd                                                          u:object_r:dpmd_exec:s0
 
 # DSP
 /dev/block/platform/soc/7824900.sdhci/by-name/dsp                                         u:object_r:dsp_block_device:s0
@@ -69,35 +59,19 @@
 /vendor/bin/wcnss_filter                                                                    u:object_r:wcnss_filter_exec:s0
 /vendor/bin/qseecomd                                                                        u:object_r:tee_exec:s0
 
+# Firmware
+/firmware                                                                                   u:object_r:firmware_file:s0
+/persist(/.*)?                                                                              u:object_r:mnt_vendor_file:s0
+
+
 # GNSS
 /vendor/bin/hw/android\.hardware\.gnss@2\.0-service-qti                     u:object_r:hal_gnss_qti_exec:s0
 
-# Perf
-/system/bin/perfservice                                                                     u:object_r:perfservice_exec:s0
+# Perf                                                                  
 /sys/devices/soc/[a-z0-9]+\.qcom,msmcci-ccimon(/.*)?                                     u:object_r:sysfs_devfreq:s0
 /sys/devices/soc/qcom,gpubw\.[a-z0-9]+/devfreq/qcom,gpubw\.[a-z0-9]+(/.*)?               u:object_r:sysfs_devfreq:s0
 /sys/devices/soc/qcom,cpubw\.[a-z0-9]+/devfreq/qcom,cpubw\.[a-z0-9]+(/.*)?               u:object_r:sysfs_devfreq:s0
 /vendor/bin/hw/vendor\.qti\.hardware\.perf@2\.0-service                     u:object_r:hal_perf_default_exec:s0
-
-# Persist
-/(mnt/vendor)/persist/bluetooth(/.*)?                                                       u:object_r:persist_bluetooth_file:s0
-/(mnt/vendor)/persist/drm(/.*)?                                                             u:object_r:persist_drm_file:s0
-/(mnt/vendor)/persist/sensors(/.*)?                                                         u:object_r:sensors_persist_file:s0
-/(mnt/vendor)/persist/alarm(/.*)?                                                           u:object_r:persist_alarm_file:s0
-/(mnt/vendor)/persist/time(/.*)?                                                            u:object_r:persist_time_file:s0
-/(mnt/vendor)/persist/data(/.*)?                                                            u:object_r:persist_drm_file:s0
-/(mnt/vendor)/persist/data/tz(/.*)?                                                         u:object_r:persist_drm_file:s0
-/(mnt/vendor)/persist/data/sfs(/.*)?                                                        u:object_r:persist_drm_file:s0
-/(mnt/vendor)/persist/qti_fp(/.*)?                                                          u:object_r:persist_qti_fp_file:s0
-/(mnt/vendor)/persist/usf(/.*)?                                                             u:object_r:persist_usf_file:s0
-/(mnt/vendor)/persist/hlos_rfs(/.*)?                                                        u:object_r:rfs_shared_hlos_file:s0
-/(mnt/vendor)/persist/display(/.*)?                                                         u:object_r:persist_display_file:s0
-/(mnt/vendor)/persist/rfs.*                                                                 u:object_r:rfs_file:s0
-/(mnt/vendor)/persist/speccfg(/.*)?                                                         u:object_r:regionalization_file:s0
-/(mnt/vendor)/persist/misc(/.*)?                                                            u:object_r:persist_misc_file:s0
-/(mnt/vendor)/persist/bms(/.*)?                                                             u:object_r:persist_bms_file:s0
-/(mnt/vendor)/persist/vpp(/.*)?                                                             u:object_r:persist_vpp_file:s0
-/(mnt/vendor)/persist/secnvm(/.*)?                                                          u:object_r:persist_secnvm_file:s0
 
 # Power hidl stats
 /vendor/bin/hw/android\.hardware\.power\.stats@1\.0-service\.mock           u:object_r:hal_power_stats_default_exec:s0
