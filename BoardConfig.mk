@@ -103,10 +103,6 @@ TARGET_SCREEN_DENSITY := 420
 TARGET_USES_C2D_COMPOSITION := true
 TARGET_USES_ION := true
 
-# Encryption
-TARGET_HW_DISK_ENCRYPTION := true
-TARGET_CRYPTFS_HW_PATH ?= vendor/qcom/opensource/cryptfs_hw
-
 # Enable real time lockscreen charging current values
 BOARD_GLOBAL_CFLAGS += -DBATTERY_REAL_INFO
 
