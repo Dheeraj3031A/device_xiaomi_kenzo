@@ -141,6 +141,7 @@ PRODUCT_PROPERTY_OVERRIDES += \
 
 # Bluetooth
 PRODUCT_PACKAGES += \
+    android.hardware.bluetooth@1.0 \
     android.hardware.bluetooth@1.0.vendor \
     android.hardware.bluetooth.audio@2.0-impl \
     audio.bluetooth.default \
@@ -245,7 +246,12 @@ PRODUCT_PACKAGES += \
     android.hardware.gatekeeper@1.0.vendor
 # GNSS
 PRODUCT_PACKAGES += \
-    android.hardware.gnss@2.0.vendor
+    android.hardware.gnss@1.0 \
+    android.hardware.gnss@1.0.vendor \
+    android.hardware.gnss@1.1 \
+    android.hardware.gnss@1.1.vendor \
+    android.hardware.gnss@2.0 \
+    android.hardware.gnss@2.0.vendor \
 
 # Health HAL
 PRODUCT_PACKAGES += \
@@ -332,6 +338,7 @@ PRODUCT_COPY_FILES += \
 # Netutils
 PRODUCT_PACKAGES += \
     netutils-wrapper-1.0 \
+    android.system.net.netd@1.1 \
     android.system.net.netd@1.1.vendor
 
 # Neural networks
