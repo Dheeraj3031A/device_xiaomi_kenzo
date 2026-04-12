@@ -31,6 +31,9 @@ persist.vendor.audio.fluence.voicerec=false
 vendor.voice.voip.conc.disabled=true
 audio.offload.multiaac.enable=true
 
+# BPF
+ro.kernel.ebpf.supported=false
+
 # Charger
 ro.charger.enable_suspend=true
 
