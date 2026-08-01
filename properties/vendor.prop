@@ -1,0 +1,2 @@
+# ZRAM
+persist.sys.zram_enabled=1

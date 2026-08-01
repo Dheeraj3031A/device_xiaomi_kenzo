@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<manifest version="1.0" type="device">
+    <!-- HALs are provided by Mesa (freedreno), TinyHAL (audio),
+         sensors-iio, and linux hci_uart + Fluoride (BT). -->
+</manifest>

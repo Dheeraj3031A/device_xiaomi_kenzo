@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<audio_policy_configuration>
+    <globalConfiguration speaker_drc_enabled="false"/>
+    <modules>
+        <module name="primary" halVersion="2.0">
+            <attachedDevices>
+                <item>Speaker</item>
+                <item>Built-In Mic</item>
+                <item>Headset</item>
+            </attachedDevices>
+            <defaultOutputDevice>Speaker</defaultOutputDevice>
+            <mixPorts>
+                <mixPort name="primary output" role="source" flags="AUDIO_OUTPUT_FLAG_PRIMARY">
+                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                             samplingRates="48000" channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
+                </mixPort>
+                <mixPort name="primary input" role="sink">
+                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                             samplingRates="48000" channelMasks="AUDIO_CHANNEL_IN_STEREO"/>
+                </mixPort>
+            </mixPorts>
+        </module>
+    </modules>
+</audio_policy_configuration>

@@ -1,0 +1,11 @@
+cc_binary {
+    name: "set_device_prop",
+    srcs: ["set_device_prop.cpp"],
+    cflags: select(soong_config_variable("xiaomi_mi89xx_mainline_set_device_prop", "divide_lcd_density_by_two"), {
+        true: ["-DDIVIDE_LCD_DENSITY_BY_TWO"],
+        default: [],
+    }),
+    shared_libs: ["libbase"],
+    recovery_available: true,
+    device_specific: true,
+}

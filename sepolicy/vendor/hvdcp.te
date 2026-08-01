@@ -1,3 +1,0 @@
-allow hvdcp sysfs:dir { r_dir_perms };
-allow hvdcp sysfs:file { rw_file_perms };
-allow hvdcp hvdcp:capability { dac_override } ;

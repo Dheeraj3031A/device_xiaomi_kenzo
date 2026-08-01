@@ -1,227 +1,109 @@
-#
-# Copyright (C) 2016 The CyanogenMod Project
-# Copyright (C) 2017 The LineageOS Project
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-#
+# SPDX-FileCopyrightText: The LineageOS Project
+# SPDX-License-Identifier: Apache-2.0
 
-DEVICE_PATH := device/xiaomi/kenzo
+TARGET_DEVICE_PATH := device/xiaomi/kenzo
+DEVICE_PATH := $(TARGET_DEVICE_PATH)
+USES_DEVICE_XIAOMI_KENZO := true
 
-TARGET_SPECIFIC_HEADER_PATH := $(DEVICE_PATH)/include
+# Inherit from your forked mainline/qcom-common (which has soc/msm8956)
+include device/mainline/qcom-common/BoardConfigMainlineQcomCommon.mk
 
-# Architecture
-TARGET_ARCH := arm64
-TARGET_ARCH_VARIANT := armv8-a
-TARGET_CPU_ABI := arm64-v8a
-TARGET_CPU_ABI2 :=
-TARGET_CPU_VARIANT := generic
-TARGET_CPU_VARIANT_RUNTIME := cortex-a53
+# Bootloader (lk2nd)
+ifneq ($(TARGET_LK2ND_PLATFORM),)
+BOARD_BOOT_HEADER_VERSION := 2
+BOARD_CUSTOM_BOOTIMG := true
+BOARD_CUSTOM_BOOTIMG_MK := $(DEVICE_PATH)/mkbootimg.mk
+BOARD_MKBOOTIMG_ARGS += --header_version $(BOARD_BOOT_HEADER_VERSION)
+TARGET_LK2ND_MAKE_FLAGS := OSVERSION_IN_BOOTIMAGE=1
+endif
 
-TARGET_2ND_ARCH := arm
-TARGET_2ND_ARCH_VARIANT := armv8-a
-TARGET_2ND_CPU_ABI := armeabi-v7a
-TARGET_2ND_CPU_ABI2 := armeabi
-TARGET_2ND_CPU_VARIANT := generic
-TARGET_2ND_CPU_VARIANT_RUNTIME := cortex-a53
+# Boot parameters
+BOARD_KERNEL_CMDLINE := \
+    $(MAINLINE_COMMON_ANDROIDBOOT_PARAMS) \
+    $(MAINLINE_COMMON_KERNEL_PARAMS) \
+    $(MAINLINE_QCOM_KERNEL_PARAMS) \
+    $(MAINLINE_QCOM_SOC_ANDROIDBOOT_PARAMS) \
+    $(MAINLINE_QCOM_SOC_KERNEL_PARAMS) \
+    androidboot.verifiedbootstate=orange \
+    console=tty0
 
-TARGET_BOARD_PLATFORM := msm8952
+ifneq ($(TARGET_LK2ND_PLATFORM),)
+BOARD_KERNEL_CMDLINE := lk2nd.pass-ramoops=zap
+endif
 
-# Assertions
-TARGET_OTA_ASSERT_DEVICE := kate,kenzo
-
-# ANT+
-BOARD_ANT_WIRELESS_DEVICE := "vfs-prerelease"
-
-# Audio
-AUDIO_FEATURE_ENABLED_AAC_ADTS_OFFLOAD := true
-AUDIO_FEATURE_ENABLED_ACDB_LICENSE := true
-AUDIO_FEATURE_ENABLED_ALAC_OFFLOAD := true
-AUDIO_FEATURE_ENABLED_ANC_HEADSET := true
-AUDIO_FEATURE_ENABLED_APE_OFFLOAD := true
-AUDIO_FEATURE_ENABLED_AUDIOSPHERE := true
-AUDIO_FEATURE_ENABLED_COMPRESS_VOIP := true
-AUDIO_FEATURE_ENABLED_EXTN_FLAC_DECODER := true
-AUDIO_FEATURE_ENABLED_EXTENDED_COMPRESS_FORMAT := true
-AUDIO_FEATURE_ENABLED_EXTN_FORMATS := true
-AUDIO_FEATURE_ENABLED_FLUENCE := true
-AUDIO_FEATURE_ENABLED_FM_POWER_OPT := true
-AUDIO_FEATURE_ENABLED_HFP := true
-AUDIO_FEATURE_ENABLED_KPI_OPTIMIZE := true
-AUDIO_FEATURE_ENABLED_MULTI_VOICE_SESSIONS := true
-AUDIO_FEATURE_ENABLED_PCM_OFFLOAD_24 := true
-AUDIO_FEATURE_ENABLED_PCM_OFFLOAD := true
-AUDIO_FEATURE_ENABLED_PROXY_DEVICE := true
-AUDIO_FEATURE_ENABLED_SND_MONITOR := true
-AUDIO_FEATURE_ENABLED_SOURCE_TRACKING := true
-AUDIO_FEATURE_ENABLED_SPKR_PROTECTION := true
-AUDIO_FEATURE_ENABLED_VBAT_MONITOR := true
-AUDIO_FEATURE_ENABLED_VOICE_CONCURRENCY :=true
-AUDIO_FEATURE_ENABLED_VORBIS_OFFLOAD := true
-AUDIO_FEATURE_ENABLED_WMA_OFFLOAD := true
-AUDIO_USE_LL_AS_PRIMARY_OUTPUT := true
-BOARD_USES_ALSA_AUDIO := true
-BOARD_SUPPORTS_SOUND_TRIGGER := true
-USE_CUSTOM_AUDIO_POLICY := 1
-
-# Bootloader
-TARGET_BOOTLOADER_BOARD_NAME := msm8952
-TARGET_NO_BOOTLOADER := true
-
-# Bluetooth
-BOARD_BLUETOOTH_BDROID_BUILDCFG_INCLUDE_DIR := $(DEVICE_PATH)/configs/bluetooth
-
-# Camera
-BOARD_QTI_CAMERA_32BIT_ONLY := true
-USE_DEVICE_SPECIFIC_CAMERA := true
-TARGET_TS_MAKEUP := true
-TARGET_PROCESS_SDK_VERSION_OVERRIDE := \
-    /system/bin/mm-qcamera-daemon=23
-
-# Display
-BOARD_USES_ADRENO := true
-TARGET_ADDITIONAL_GRALLOC_10_USAGE_BITS := 0x02000000U
-TARGET_CONTINUOUS_SPLASH_ENABLED := true
-TARGET_SCREEN_DENSITY := 420
-TARGET_USES_C2D_COMPOSITION := true
-TARGET_USES_ION := true
-
-# Encryption
-TARGET_HW_DISK_ENCRYPTION := true
-TARGET_CRYPTFS_HW_PATH ?= vendor/qcom/opensource/cryptfs_hw
-
-# Enable real time lockscreen charging current values
-BOARD_GLOBAL_CFLAGS += -DBATTERY_REAL_INFO
-
-# Exclude serif fonts for saving system.img size.
-EXCLUDE_SERIF_FONTS := true
+BOARD_KERNEL_CMDLINE += \
+    androidboot.selinux=permissive \
+    audit=0 \
+    androidboot.hardware=kenzo
 
 # Filesystem
-BOARD_FLASH_BLOCK_SIZE := 131072 # (BOARD_KERNEL_PAGESIZE * 64)
+TARGET_USERIMAGES_USE_F2FS := true
+TARGET_USERIMAGES_USE_EXT4 := true
+
+# Kernel (Codeberg msm8956-mainline)
+TARGET_KERNEL_SOURCE := kernel/mainline/msm8956-mainline
+TARGET_DTB_LIST_WILDCARD := \
+    qcom/msm8956-xiaomi-kenzo \
+    qcom/msm8976-xiaomi-kenzo
+TARGET_KERNEL_CONFIG_EXT := \
+    kernel/mainline/configs/fragments/android-base-pre/common.config \
+    kernel/mainline/configs/fragments/android-base-pre/arm64.config \
+    kernel/configs/b/android-6.12/android-base.config \
+    kernel/mainline/configs/fragments/android-base-conditional/CONFIG_ARM64-y.config \
+    kernel/mainline/configs/fragments/common.config \
+    kernel/mainline/configs/fragments/y/fbcon.config \
+    kernel/mainline/configs/fragments/n/disable-clang-hardening-features.config \
+    kernel/mainline/configs/fragments/n/faster-build-time.config \
+    $(TARGET_DEVICE_PATH)/kconfigs/basic.config \
+    $(TARGET_DEVICE_PATH)/kconfigs/fixups.config
+
+ifneq ($(TARGET_LK2ND_PLATFORM),)
+BOARD_INCLUDE_DTB_IN_BOOTIMG := true
+endif
+
+# Kernel modules
+BOARD_RECOVERY_RAMDISK_KERNEL_MODULES_LOAD := \
+    $(strip $(shell cat $(TARGET_DEVICE_PATH)/modprobe/mainline/modules.load.basic)) \
+    $(strip $(shell cat $(TARGET_DEVICE_PATH)/modprobe/mainline/modules.load.drm)) \
+    $(strip $(shell cat $(TARGET_DEVICE_PATH)/modprobe/mainline/modules.load.panel.kenzo)) \
+    $(strip $(shell cat $(TARGET_DEVICE_PATH)/modprobe/mainline/modules.load.touchscreen))
+BOARD_VENDOR_KERNEL_MODULES_LOAD := \
+    $(BOARD_RECOVERY_RAMDISK_KERNEL_MODULES_LOAD)
+RECOVERY_KERNEL_MODULES := \
+    $(BOARD_RECOVERY_RAMDISK_KERNEL_MODULES_LOAD)
+TARGET_AUTO_COLLECT_KERNEL_MODULE_DEPS := true
+
+# OTA
+AB_OTA_UPDATER := false
+TARGET_OTA_ASSERT_DEVICE := kate,kenzo
+
+# Partitions (A-only; stock kenzo layout)
 BOARD_BOOTIMAGE_PARTITION_SIZE := 67108864
-BOARD_CACHEIMAGE_FILE_SYSTEM_TYPE := ext4
 BOARD_CACHEIMAGE_PARTITION_SIZE := 268435456
-BOARD_PERSISTIMAGE_PARTITION_SIZE := 33554432
+BOARD_CACHEIMAGE_FILE_SYSTEM_TYPE := ext4
 BOARD_RECOVERYIMAGE_PARTITION_SIZE := 67108864
-BOARD_SYSTEMIMAGE_PARTITION_SIZE := 2684354560
-BOARD_VENDORIMAGE_FILE_SYSTEM_TYPE := ext4
+BOARD_SYSTEMIMAGE_EXTFS_INODE_COUNT := -1
+BOARD_SYSTEMIMAGE_PARTITION_SIZE := 3221225472
+BOARD_VENDORIMAGE_EXTFS_INODE_COUNT := -1
 BOARD_VENDORIMAGE_PARTITION_SIZE := 536870912
+BOARD_VENDORIMAGE_FILE_SYSTEM_TYPE := ext4
+BOARD_USES_METADATA_PARTITION := true
 TARGET_COPY_OUT_VENDOR := vendor
-BOARD_USERDATAIMAGE_PARTITION_SIZE := 26838785024 # 26838801408 - 16384
-
-TARGET_FS_CONFIG_GEN := $(DEVICE_PATH)/config.fs
-
-BOARD_ROOT_EXTRA_SYMLINKS := \
-    /vendor/dsp:/dsp \
-    /vendor/firmware_mnt:/firmware \
-    /mnt/vendor/persist:/persist
-
-# FM
-BOARD_HAVE_QCOM_FM := true
-TARGET_QCOM_NO_FM_FIRMWARE := true
-
-# HIDL
-DEVICE_MANIFEST_FILE := $(DEVICE_PATH)/manifest.xml
-DEVICE_MATRIX_FILE   := $(DEVICE_PATH)/compatibility_matrix.xml
-
-# GPS
-USE_DEVICE_SPECIFIC_GPS := true
-USE_DEVICE_SPECIFIC_LOC_API := true
-TARGET_NO_RPC := true
-
-# Init
-TARGET_INIT_VENDOR_LIB := //$(DEVICE_PATH):libinit_msm
-TARGET_PLATFORM_DEVICE_BASE := /devices/soc.0/
-TARGET_RECOVERY_DEVICE_MODULES := libinit_msm
-
-# Kernel
-BOARD_KERNEL_CMDLINE := androidboot.hardware=qcom ehci-hcd.park=3 androidboot.bootdevice=7824900.sdhci lpm_levels.sleep_disabled=1 ramoops_memreserve=4M
-BOARD_KERNEL_CMDLINE += loop.max_part=7
-BOARD_KERNEL_CMDLINE += firmware_class.path=/vendor/firmware_mnt/image
-BOARD_KERNEL_CMDLINE += androidboot.init_fatal_reboot_target=recovery
-BOARD_KERNEL_BASE := 0x80000000
-BOARD_KERNEL_PAGESIZE := 2048
-BOARD_MKBOOTIMG_ARGS := --ramdisk_offset 0x01000000 --tags_offset 0x00000100
-BOARD_KERNEL_IMAGE_NAME := Image.gz-dtb
-TARGET_KERNEL_HEADER_ARCH := arm64
-TARGET_KERNEL_SOURCE := kernel/xiaomi/kenzo
-TARGET_KERNEL_CONFIG := kenzo_defconfig
-
-# Keymaster
-TARGET_PROVIDES_KEYMASTER := true
-
-# Legacy memfd
-TARGET_HAS_MEMFD_BACKPORT := true
-
-# Lights
-BOARD_LIGHTS_VARIANT := aw2013
-
-# Peripheral manager
-TARGET_PER_MGR_ENABLED := true
-
-# Power
-TARGET_USES_INTERACTION_BOOST := true
-#TARGET_USES_NON_LEGACY_POWERHAL := true
-
-# Properties
-TARGET_ODM_PROP += $(DEVICE_PATH)/odm.prop
-TARGET_SYSTEM_PROP += $(DEVICE_PATH)/system.prop
-
-# Security patch level
-VENDOR_SECURITY_PATCH := 2018-07-01
-
-# Qualcomm
-BOARD_USES_QCOM_HARDWARE := true
 
 # Recovery
-TARGET_RECOVERY_FSTAB := $(DEVICE_PATH)/rootdir/etc/fstab.qcom
-TARGET_USERIMAGES_USE_EXT4 := true
-TARGET_USERIMAGES_USE_F2FS := true
+TARGET_RECOVERY_DENSITY := xxhdpi
+TARGET_RECOVERY_FSTAB := $(TARGET_DEVICE_PATH)/fstab/fstab.kenzo
 
-# Releasetools
-TARGET_RELEASETOOLS_EXTENSIONS := $(DEVICE_PATH)/releasetools
+# Properties
+TARGET_VENDOR_PROP += $(DEVICE_PATH)/properties/vendor.prop
 
-# RIL
-PROTOBUF_SUPPORTED := true
-TARGET_USES_ALTERNATIVE_MANUAL_NETWORK_SELECT := true
+# Ramdisk
+BOARD_RAMDISK_USE_LZ4 := true
 
 # SELinux
-include device/qcom/sepolicy-legacy/sepolicy.mk
-BOARD_VENDOR_SEPOLICY_DIRS += $(DEVICE_PATH)/sepolicy/vendor
-BOARD_PLAT_PRIVATE_SEPOLICY_DIR += $(DEVICE_PATH)/sepolicy/private
+BOARD_ODM_SEPOLICY_DIRS += \
+    $(DEVICE_PATH)/sepolicy/odm
 
-# Wifi
-WPA_SUPPLICANT_VERSION      := VER_0_8_X
-BOARD_HAS_QCOM_WLAN         := true
-BOARD_HAS_QCOM_WLAN_SDK     := true
-BOARD_WLAN_DEVICE           := qcwcn
-BOARD_WPA_SUPPLICANT_DRIVER := NL80211
-BOARD_WPA_SUPPLICANT_PRIVATE_LIB := lib_driver_cmd_$(BOARD_WLAN_DEVICE)
-BOARD_HOSTAPD_DRIVER        := NL80211
-BOARD_HOSTAPD_PRIVATE_LIB   := lib_driver_cmd_$(BOARD_WLAN_DEVICE)
-WIFI_DRIVER_FW_PATH_AP      := "ap"
-WIFI_DRIVER_FW_PATH_STA     := "sta"
-WIFI_HIDL_FEATURE_DISABLE_AP_MAC_RANDOMIZATION := true
-WIFI_AVOID_IFACE_RESET_MAC_CHANGE	:= true
-WIFI_HIDL_UNIFIED_SUPPLICANT_SERVICE_RC_ENTRY := true
-
-# DT2W
-TARGET_TAP_TO_WAKE_NODE := "/sys/android_touch/doubletap2wake"
-
-# Enable DRM plugins 64 bit compilation
-TARGET_ENABLE_MEDIADRM_64 := true
-
-# Inherit from the proprietary version
-include vendor/xiaomi/kenzo/BoardConfigVendor.mk
-
-BUILD_BROKEN_DUP_RULES := true
-BUILD_BROKEN_USES_BUILD_COPY_HEADERS := true
+# VINTF
+DEVICE_MANIFEST_FILE := \
+    $(DEVICE_PATH)/vintf/manifest.xml

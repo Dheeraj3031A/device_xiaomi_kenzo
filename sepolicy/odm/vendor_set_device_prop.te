@@ -1,0 +1,8 @@
+type vendor_set_device_prop, domain;
+type vendor_set_device_prop_exec, exec_type, vendor_file_type, file_type;
+init_daemon_domain(vendor_set_device_prop)
+r_dir_file(vendor_set_device_prop, vendor_sysfs_dt_model)
+set_prop(vendor_set_device_prop, vendor_device_prop)
+recovery_only(`
+    domain_trans(init, rootfs, vendor_set_device_prop)
+')

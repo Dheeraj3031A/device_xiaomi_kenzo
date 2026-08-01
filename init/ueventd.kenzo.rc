@@ -1,0 +1,5 @@
+# SPDX-FileCopyrightText: The LineageOS Project
+# SPDX-License-Identifier: Apache-2.0
+
+firmware_directories /vendor/firmware_mnt/image/ /odm/firmware/
+modalias_handling enabled

@@ -1,1 +1,0 @@
-allow gsid device:file w_file_perms;

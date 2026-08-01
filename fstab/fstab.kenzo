@@ -1,0 +1,32 @@
+# SPDX-FileCopyrightText: The LineageOS Project
+# SPDX-License-Identifier: Apache-2.0
+
+# Boot
+/dev/block/by-name/boot      /boot      emmc    defaults                                                       defaults
+# Cache
+/dev/block/by-name/cache     /cache     ext4    nodev,noatime,nosuid,discard                                   check,formattable
+/dev/block/by-name/cache     /cache     f2fs    nodev,noatime,nosuid,discard                                   check,formattable
+# Firmware
+/dev/block/by-name/modem     /vendor/firmware_mnt  vfat  ro,context=u:object_r:firmware_mnt_file:s0,shortname=lower,uid=1000,gid=1000,dmask=227,fmask=337  defaults
+# Metadata
+/dev/block/by-name/oem       /metadata  ext4    nodev,noatime,nosuid,discard,data=journal,commit=1             check,formattable,first_stage_mount,metadata_csum
+# Misc
+/dev/block/by-name/misc      /misc      emmc    defaults                                                       defaults
+# Persist
+/dev/block/by-name/persist   /mnt/vendor/persist  ext4  nosuid,nodev,noatime,ro                              defaults
+# Recovery
+/dev/block/by-name/recovery  /recovery  emmc    defaults                                                       defaults
+# SDcard
+/devices/platform/soc@0/7864900.mmc/mmc_host/mmc*  auto  auto  defaults                            voldmanaged=sdcard:auto,encryptable=userdata,noemulatedsd
+# System
+/dev/block/by-name/system    /system    erofs   noatime,ro                                                     first_stage_mount
+/dev/block/by-name/system    /system    ext4    noatime,ro                                                     first_stage_mount
+# USB
+/devices/platform/soc@0/70f8800.usb/*/usb*  auto  auto  defaults                                            voldmanaged=usb:auto,noemulatedsd
+# Userdata
+/dev/block/by-name/userdata  /data      ext4    nodev,noatime,nosuid,discard                                   latemount,check,quota,formattable
+/dev/block/by-name/userdata  /data      f2fs    nodev,noatime,nosuid,discard,reserve_root=32768                latemount,check,quota,formattable
+# Vendor
+/dev/block/by-name/cust      /vendor    ext4    noatime,ro                                                     first_stage_mount
+# ZRAM
+/dev/block/zram0             none       swap    defaults                                                       zramsize=50%

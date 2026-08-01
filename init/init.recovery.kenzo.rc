@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: The LineageOS Project
+# SPDX-License-Identifier: Apache-2.0
+
+on init
+    exec u:r:vendor_set_device_prop:s0 -- /system/bin/set_device_prop
+    setprop ro.sf.lcd_density ${ro.vendor.device.lcd_density}
+
+on post-fs
+    exec u:r:vendor_modprobe:s0 -- /vendor/bin/modprobe -s -d /vendor/lib/modules --all=/vendor/etc/modules.load.basic
+    exec u:r:vendor_modprobe:s0 -- /vendor/bin/modprobe -s -d /vendor/lib/modules --all=/vendor/etc/modules.load.drm
+    exec u:r:vendor_modprobe:s0 -- /vendor/bin/modprobe -s -d /vendor/lib/modules --all=/vendor/etc/modules.load.panel.kenzo
+    exec u:r:vendor_modprobe:s0 -- /vendor/bin/modprobe -s -d /vendor/lib/modules --all=/vendor/etc/modules.load.touchscreen
+    trigger start_all_remoteproc
